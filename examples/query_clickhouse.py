@@ -16,7 +16,9 @@ def print_query_results(title, query, limit=None):
 
     client = get_client()
     result = client.query(query)
-    df = result.result_df
+
+    # Convert QueryResult to pandas DataFrame
+    df = pd.DataFrame(result.result_rows, columns=result.column_names)
 
     if limit and len(df) > limit:
         df = df.head(limit)
@@ -32,15 +34,17 @@ def main():
     print("🔍 Polymarket ClickHouse Query Examples")
     print("=" * 70)
 
-    # Query 1: Table row counts
+    # Query 1: Table row counts and sizes
     print_query_results(
         "Table Statistics",
         """
-        SELECT 'markets' as table, count() as rows, formatReadableSize(sum(data_compressed_bytes)) as size FROM system.tables WHERE database = 'polymarket' AND name = 'markets'
-        UNION ALL
-        SELECT 'order_filled', count(), formatReadableSize(sum(data_compressed_bytes)) FROM system.tables WHERE database = 'polymarket' AND name = 'order_filled'
-        UNION ALL
-        SELECT 'trades', count(), formatReadableSize(sum(data_compressed_bytes)) FROM system.tables WHERE database = 'polymarket' AND name = 'trades'
+        SELECT 
+            name as table_name,
+            formatReadableQuantity(total_rows) as rows,
+            formatReadableSize(total_bytes) as size
+        FROM system.tables
+        WHERE database = 'polymarket'
+        ORDER BY total_bytes DESC
         """,
     )
 
