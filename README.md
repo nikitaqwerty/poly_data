@@ -255,6 +255,245 @@ USERS = {
 trader_df = df.filter((pl.col("maker") == USERS['domah']))
 ```
 
+## ClickHouse Integration
+
+This repository includes a complete ClickHouse integration for storing and querying Polymarket data at scale.
+
+### Prerequisites
+
+1. **Install ClickHouse**: Follow the [official installation guide](https://clickhouse.com/docs/en/install)
+   ```bash
+   # macOS
+   brew install clickhouse
+   
+   # Linux
+   curl https://clickhouse.com/ | sh
+   ```
+
+2. **Start ClickHouse**:
+   ```bash
+   # Start server (may require sudo or use homebrew services)
+   clickhouse-server
+   
+   # Or with homebrew
+   brew services start clickhouse
+   ```
+
+3. **Install Python dependencies**:
+   ```bash
+   uv sync
+   ```
+
+### Configuration
+
+Configure ClickHouse connection via environment variables (optional):
+
+```bash
+export CLICKHOUSE_HOST=localhost      # default
+export CLICKHOUSE_PORT=8123           # default
+export CLICKHOUSE_USER=default        # default
+export CLICKHOUSE_PASSWORD=           # default: empty
+export CLICKHOUSE_DATABASE=polymarket # default
+```
+
+### Initial Setup
+
+Run this **once** to create tables and load existing CSV data:
+
+```bash
+uv run python clickhouse_initial_setup.py
+```
+
+This will:
+- Create the `polymarket` database
+- Create three tables: `markets`, `order_filled`, and `trades`
+- Load all existing CSV data into ClickHouse
+
+**Note**: This can take several minutes depending on data size.
+
+### Incremental Updates
+
+After initial setup, use this for regular updates:
+
+```bash
+uv run python update_all_clickhouse.py
+```
+
+This pipeline:
+1. Updates markets from Polymarket API → `markets.csv`
+2. Updates order events from Goldsky → `goldsky/orderFilled.csv`
+3. Processes trades → `processed/trades.csv`
+4. **Loads all new data into ClickHouse** (incremental)
+
+### ClickHouse Schema
+
+#### markets table
+```sql
+CREATE TABLE polymarket.markets (
+    createdAt DateTime64(3),
+    id String,
+    question String,
+    answer1 String,
+    answer2 String,
+    neg_risk Boolean,
+    market_slug String,
+    token1 String,
+    token2 String,
+    condition_id String,
+    volume Float64,
+    ticker String,
+    closedTime Nullable(DateTime64(3))
+) ENGINE = MergeTree()
+ORDER BY (createdAt, id);
+```
+
+#### order_filled table
+```sql
+CREATE TABLE polymarket.order_filled (
+    timestamp DateTime,
+    maker String,
+    makerAssetId String,
+    makerAmountFilled UInt64,
+    taker String,
+    takerAssetId String,
+    takerAmountFilled UInt64,
+    transactionHash String
+) ENGINE = MergeTree()
+ORDER BY (timestamp, transactionHash, maker, taker);
+```
+
+#### trades table
+```sql
+CREATE TABLE polymarket.trades (
+    timestamp DateTime64(6),
+    market_id String,
+    maker String,
+    taker String,
+    nonusdc_side String,
+    maker_direction String,
+    taker_direction String,
+    price Float64,
+    usd_amount Float64,
+    token_amount Float64,
+    transactionHash String
+) ENGINE = MergeTree()
+ORDER BY (timestamp, market_id, transactionHash);
+```
+
+### Querying Data
+
+Connect to ClickHouse and run queries:
+
+```bash
+clickhouse-client
+```
+
+```sql
+-- Check table sizes
+SELECT 'markets' as table, count() as rows FROM polymarket.markets
+UNION ALL
+SELECT 'order_filled', count() FROM polymarket.order_filled
+UNION ALL
+SELECT 'trades', count() FROM polymarket.trades;
+
+-- Get trading volume by market
+SELECT 
+    m.question,
+    count() as trade_count,
+    sum(t.usd_amount) as total_volume,
+    avg(t.price) as avg_price
+FROM polymarket.trades t
+JOIN polymarket.markets m ON t.market_id = m.id
+GROUP BY m.question
+ORDER BY total_volume DESC
+LIMIT 10;
+
+-- Get top traders by volume
+SELECT 
+    maker as trader,
+    count() as trade_count,
+    sum(usd_amount) as total_volume
+FROM polymarket.trades
+WHERE maker NOT IN ('0xc5d563a36ae78145c45a50134d48a1215220f80a', 
+                     '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e')
+GROUP BY trader
+ORDER BY total_volume DESC
+LIMIT 20;
+
+-- Trading activity over time
+SELECT 
+    toStartOfDay(timestamp) as day,
+    count() as trades,
+    sum(usd_amount) as volume
+FROM polymarket.trades
+GROUP BY day
+ORDER BY day DESC
+LIMIT 30;
+```
+
+### Python Analysis with ClickHouse
+
+```python
+import clickhouse_connect
+from clickhouse_utils.config import get_client
+
+# Get client
+client = get_client()
+
+# Query data directly
+result = client.query("""
+    SELECT 
+        market_id,
+        count() as trades,
+        sum(usd_amount) as volume
+    FROM polymarket.trades
+    GROUP BY market_id
+    ORDER BY volume DESC
+    LIMIT 10
+""")
+
+# Convert to pandas DataFrame
+df = result.result_df
+print(df)
+```
+
+### Architecture
+
+```
+CSV Files (markets.csv, goldsky/, processed/)
+    ↓
+Initial Load (clickhouse_initial_setup.py)
+    ↓
+ClickHouse (polymarket database)
+    ↓
+Incremental Updates (update_all_clickhouse.py)
+    ↑
+New Data Pipeline (update_all.py)
+```
+
+### Performance
+
+ClickHouse provides:
+- **Fast aggregations**: 100M+ rows scanned in seconds
+- **Efficient storage**: Columnar compression (10x+ smaller than CSV)
+- **Real-time queries**: Sub-second response for most analytical queries
+- **Scalability**: Handles billions of rows on a single node
+
+### Troubleshooting
+
+**Connection refused**:
+- Ensure ClickHouse server is running: `clickhouse-client --query "SELECT 1"`
+- Check logs: `tail -f /var/log/clickhouse-server/clickhouse-server.log`
+
+**Permission denied**:
+- Set proper CLICKHOUSE_USER and CLICKHOUSE_PASSWORD env vars
+- Check ClickHouse user permissions
+
+**Data not loading**:
+- Run initial setup first: `python clickhouse_initial_setup.py`
+- Check CSV files exist and are readable
+- Review error messages in console output
+
 ## License
 
 Go wild with it
