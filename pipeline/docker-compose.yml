@@ -5,7 +5,7 @@ services:
     ports:
       - "6379:6379"
     volumes:
-      - redis-data:/data
+      - polymarket-redis-data:/data
     command: redis-server --appendonly yes
     restart: unless-stopped
     healthcheck:
@@ -21,7 +21,7 @@ services:
       - "8123:8123"
       - "9000:9000"
     volumes:
-      - clickhouse-data:/var/lib/clickhouse
+      - polymarket-clickhouse-data:/var/lib/clickhouse
     environment:
       - CLICKHOUSE_DB=polymarket
       - CLICKHOUSE_USER=default
@@ -31,6 +31,28 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  schema-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pipeline-schema-init
+    command: python3 setup_schema.py
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DATABASE=polymarket
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=clickhouse123
+    restart: "no"
 
   polymarket-markets-ingester:
     build:
@@ -88,8 +110,10 @@ services:
     container_name: trade-processor
     command: python3 processors/trade_processor.py
     depends_on:
-      - redis
-      - clickhouse
+      redis:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -106,8 +130,10 @@ services:
     container_name: clickhouse-writer
     command: python3 processors/clickhouse_writer.py
     depends_on:
-      - redis
-      - clickhouse
+      redis:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -127,8 +153,10 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - redis
-      - clickhouse
+      redis:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -139,5 +167,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  redis-data:
-  clickhouse-data:
+  polymarket-redis-data:
+  polymarket-clickhouse-data:

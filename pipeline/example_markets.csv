@@ -1,4 +1,0 @@
-createdAt,id,question,answer1,answer2,neg_risk,market_slug,token1,token2,condition_id,volume,ticker,event_slug,closedTime,tags
-2024-01-01T12:00:00Z,market001,Will it rain tomorrow?,Yes,No,false,will-it-rain-tomorrow,0x1234567890abcdef1234567890abcdef12345678,0xabcdef1234567890abcdef1234567890abcdef12,condition001,15420.75,RAIN,weather-events,2024-12-31T23:59:59Z,weather;prediction;daily
-2024-01-02T08:30:00Z,market002,Will BTC hit $50k in 2024?,Yes,No,false,btc-50k-2024,0x2345678901bcdef2345678901bcdef234567890,0xbcdef2345678901bcdef2345678901bcdef2345,condition002,98765.50,BTC50K,crypto-events,,crypto;bitcoin;price
-2024-01-03T15:45:00Z,market003,Will the election be held on time?,Yes,No,true,election-on-time,0x3456789012cdef3456789012cdef345678901234,0xcdef3456789012cdef3456789012cdef34567890,condition003,50000.00,ELECT,politics-events,2024-11-05T23:59:59Z,politics;election;2024

@@ -7,7 +7,7 @@ Reads from Redis streams and writes to ClickHouse in batches
 
 import time
 from typing import List, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 
 import sys
 from pathlib import Path
@@ -50,27 +50,52 @@ def write_markets_batch(client, markets: List[Dict]) -> int:
         return 0
 
     try:
+        logger.info("Processing %d markets for ClickHouse insertion...", len(markets))
+
         data = []
-        for market in markets:
+        for idx, market in enumerate(markets):
             # Parse datetime strings
-            created_at = (
-                datetime.fromisoformat(market["createdAt"].replace("Z", "+00:00"))
-                if market.get("createdAt")
-                else None
-            )
-            closed_time = (
-                datetime.fromisoformat(market["closedTime"].replace("Z", "+00:00"))
-                if market.get("closedTime")
-                else None
-            )
+            created_at = None
+            if market.get("createdAt"):
+                try:
+                    created_at = datetime.fromisoformat(
+                        market["createdAt"].replace("Z", "+00:00")
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Market %d: Failed to parse createdAt '%s': %s",
+                        idx,
+                        market.get("createdAt"),
+                        e,
+                    )
+
+            closed_time = None
+            if market.get("closedTime"):
+                try:
+                    closed_time = datetime.fromisoformat(
+                        market["closedTime"].replace("Z", "+00:00")
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Market %d: Failed to parse closedTime '%s': %s",
+                        idx,
+                        market.get("closedTime"),
+                        e,
+                    )
 
             # Handle id - convert to integer
             id_value = market.get("id", "0")
-            market_id = (
-                int(id_value)
-                if str(id_value).strip() and str(id_value).strip().isdigit()
-                else 0
-            )
+            try:
+                market_id = (
+                    int(id_value)
+                    if str(id_value).strip() and str(id_value).strip().isdigit()
+                    else 0
+                )
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Market %d: Failed to parse id '%s': %s", idx, id_value, e
+                )
+                market_id = 0
 
             # Handle volume - convert to float, handling empty strings
             volume_value = market.get("volume", 0)
@@ -79,7 +104,13 @@ def write_markets_batch(client, markets: List[Dict]) -> int:
             else:
                 try:
                     volume = float(volume_value)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        "Market %d: Failed to parse volume '%s': %s",
+                        idx,
+                        volume_value,
+                        e,
+                    )
                     volume = 0.0
 
             row = (
@@ -95,10 +126,20 @@ def write_markets_batch(client, markets: List[Dict]) -> int:
                 str(market.get("condition_id", "")),
                 volume,
                 str(market.get("ticker", "")),
-                str(market.get("event_slug", "")),  # Added for joining with events
+                str(market.get("event_slug", "")),
                 closed_time,
             )
+
+            # Check for None in non-nullable fields (createdAt is non-nullable)
+            if created_at is None:
+                logger.error(
+                    "Market %d has None createdAt! Full market data: %s", idx, market
+                )
+                raise ValueError(f"Market {idx} has None in createdAt field")
+
             data.append(row)
+
+        logger.info("Prepared %d market rows for insertion", len(data))
 
         client.insert(
             f"{clickhouse_config.database}.markets",
@@ -121,10 +162,18 @@ def write_markets_batch(client, markets: List[Dict]) -> int:
             ],
         )
 
+        logger.info("Successfully inserted %d markets to ClickHouse", len(data))
         return len(data)
 
     except Exception as e:
         logger.error("Error writing markets to ClickHouse: %s", e)
+        if "data" in locals() and data:
+            logger.error(
+                "Failed batch had %d rows. First row types: %s",
+                len(data),
+                [type(x).__name__ for x in data[0]],
+            )
+            logger.error("First row values: %s", data[0])
         raise
 
 
@@ -143,8 +192,10 @@ def write_events_batch(client, events: List[Dict]) -> int:
         return 0
 
     try:
+        logger.info("Processing %d events for ClickHouse insertion...", len(events))
+
         data = []
-        for event in events:
+        for idx, event in enumerate(events):
             # Parse tags from semicolon-separated string
             tags_str = event.get("tags", "")
             tags_list = tags_str.split(";") if tags_str else []
@@ -156,8 +207,13 @@ def write_events_batch(client, events: List[Dict]) -> int:
                     created_at = datetime.fromisoformat(
                         event["createdAt"].replace("Z", "+00:00")
                     )
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Event %d: Failed to parse createdAt '%s': %s",
+                        idx,
+                        event.get("createdAt"),
+                        e,
+                    )
 
             start_date = None
             if event.get("startDate"):
@@ -165,8 +221,13 @@ def write_events_batch(client, events: List[Dict]) -> int:
                     start_date = datetime.fromisoformat(
                         event["startDate"].replace("Z", "+00:00")
                     )
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Event %d: Failed to parse startDate '%s': %s",
+                        idx,
+                        event.get("startDate"),
+                        e,
+                    )
 
             end_date = None
             if event.get("endDate"):
@@ -174,8 +235,13 @@ def write_events_batch(client, events: List[Dict]) -> int:
                     end_date = datetime.fromisoformat(
                         event["endDate"].replace("Z", "+00:00")
                     )
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Event %d: Failed to parse endDate '%s': %s",
+                        idx,
+                        event.get("endDate"),
+                        e,
+                    )
 
             # Handle numeric fields - convert to proper types, handling empty strings
             markets_count_value = event.get("markets_count", 0)
@@ -185,13 +251,22 @@ def write_events_batch(client, events: List[Dict]) -> int:
                     if markets_count_value not in ("", None)
                     else 0
                 )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Event %d: Failed to parse markets_count '%s': %s",
+                    idx,
+                    markets_count_value,
+                    e,
+                )
                 markets_count = 0
 
             volume_value = event.get("volume", 0)
             try:
                 volume = float(volume_value) if volume_value not in ("", None) else 0.0
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Event %d: Failed to parse volume '%s': %s", idx, volume_value, e
+                )
                 volume = 0.0
 
             liquidity_value = event.get("liquidity", 0)
@@ -199,8 +274,39 @@ def write_events_batch(client, events: List[Dict]) -> int:
                 liquidity = (
                     float(liquidity_value) if liquidity_value not in ("", None) else 0.0
                 )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Event %d: Failed to parse liquidity '%s': %s",
+                    idx,
+                    liquidity_value,
+                    e,
+                )
                 liquidity = 0.0
+
+            # Use epoch as default for None datetime values to avoid insertion errors
+            # ClickHouse's clickhouse-connect library has issues with None in datetime columns
+            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            if created_at is None:
+                logger.debug(
+                    "Event %d (id=%s) has None createdAt, using epoch default",
+                    idx,
+                    event.get("id"),
+                )
+                created_at = epoch
+            if start_date is None:
+                logger.debug(
+                    "Event %d (id=%s) has None startDate, using epoch default",
+                    idx,
+                    event.get("id"),
+                )
+                start_date = epoch
+            if end_date is None:
+                logger.debug(
+                    "Event %d (id=%s) has None endDate, using epoch default",
+                    idx,
+                    event.get("id"),
+                )
+                end_date = epoch
 
             row = (
                 str(event.get("id", "")),
@@ -219,7 +325,62 @@ def write_events_batch(client, events: List[Dict]) -> int:
                 volume,
                 liquidity,
             )
+
+            # Validate row data before adding to batch (log first 3 events for debugging)
+            if idx < 3:
+                logger.debug(
+                    "Event %d row data: id=%s, slug=%s, ticker=%s, "
+                    "createdAt=%s, startDate=%s, endDate=%s, "
+                    "tags=%s, markets_count=%s, active=%s, closed=%s, archived=%s, "
+                    "volume=%s, liquidity=%s",
+                    idx,
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[5],
+                    row[6],
+                    row[7],
+                    row[8],
+                    row[9],
+                    row[10],
+                    row[11],
+                    row[12],
+                    row[13],
+                    row[14],
+                )
+
+            # Check for None values in non-nullable fields
+            if None in [
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[9],
+                row[10],
+                row[11],
+                row[12],
+                row[13],
+                row[14],
+            ]:
+                logger.error(
+                    "Event %d has None in non-nullable field! Full event data: %s",
+                    idx,
+                    event,
+                )
+                logger.error("Event %d row values: %s", idx, row)
+                raise ValueError(f"Event {idx} contains None in non-nullable field")
+
             data.append(row)
+
+        # Log sample of data being inserted
+        logger.info(
+            "Prepared %d rows for insertion. Sample (first row): id=%s, slug=%s, ticker=%s",
+            len(data),
+            data[0][0] if data else "N/A",
+            data[0][1] if data else "N/A",
+            data[0][2] if data else "N/A",
+        )
 
         client.insert(
             f"{clickhouse_config.database}.polymarket_events",
@@ -243,10 +404,21 @@ def write_events_batch(client, events: List[Dict]) -> int:
             ],
         )
 
+        logger.info("Successfully inserted %d events to ClickHouse", len(data))
         return len(data)
 
     except Exception as e:
         logger.error("Error writing events to ClickHouse: %s", e)
+        # Log more details about the data being inserted
+        if "data" in locals() and data:
+            logger.error(
+                "Failed batch had %d rows. First row types: %s",
+                len(data),
+                [type(x).__name__ for x in data[0]],
+            )
+            logger.error("First row values: %s", data[0])
+            if len(data) > 1:
+                logger.error("Last row values: %s", data[-1])
         raise
 
 
@@ -265,17 +437,33 @@ def write_trades_batch(client, trades: List[Dict]) -> int:
         return 0
 
     try:
+        logger.info("Processing %d trades for ClickHouse insertion...", len(trades))
+
         data = []
-        for trade in trades:
-            timestamp = datetime.fromisoformat(
-                trade["timestamp"].replace("Z", "+00:00")
-            )
+        for idx, trade in enumerate(trades):
+            # Parse timestamp
+            timestamp = None
+            if trade.get("timestamp"):
+                try:
+                    timestamp = datetime.fromisoformat(
+                        trade["timestamp"].replace("Z", "+00:00")
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Trade %d: Failed to parse timestamp '%s': %s",
+                        idx,
+                        trade.get("timestamp"),
+                        e,
+                    )
 
             # Handle numeric fields - convert to proper types, handling empty strings
             price_value = trade.get("price", 0)
             try:
                 price = float(price_value) if price_value not in ("", None) else 0.0
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Trade %d: Failed to parse price '%s': %s", idx, price_value, e
+                )
                 price = 0.0
 
             usd_amount_value = trade.get("usd_amount", 0)
@@ -285,7 +473,13 @@ def write_trades_batch(client, trades: List[Dict]) -> int:
                     if usd_amount_value not in ("", None)
                     else 0.0
                 )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Trade %d: Failed to parse usd_amount '%s': %s",
+                    idx,
+                    usd_amount_value,
+                    e,
+                )
                 usd_amount = 0.0
 
             token_amount_value = trade.get("token_amount", 0)
@@ -295,7 +489,13 @@ def write_trades_batch(client, trades: List[Dict]) -> int:
                     if token_amount_value not in ("", None)
                     else 0.0
                 )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Trade %d: Failed to parse token_amount '%s': %s",
+                    idx,
+                    token_amount_value,
+                    e,
+                )
                 token_amount = 0.0
 
             row = (
@@ -311,7 +511,17 @@ def write_trades_batch(client, trades: List[Dict]) -> int:
                 token_amount,
                 str(trade.get("transactionHash", "")),
             )
+
+            # Check for None in timestamp (non-nullable field)
+            if timestamp is None:
+                logger.error(
+                    "Trade %d has None timestamp! Full trade data: %s", idx, trade
+                )
+                raise ValueError(f"Trade {idx} has None in timestamp field")
+
             data.append(row)
+
+        logger.info("Prepared %d trade rows for insertion", len(data))
 
         client.insert(
             f"{clickhouse_config.database}.trades",
@@ -331,10 +541,18 @@ def write_trades_batch(client, trades: List[Dict]) -> int:
             ],
         )
 
+        logger.info("Successfully inserted %d trades to ClickHouse", len(data))
         return len(data)
 
     except Exception as e:
         logger.error("Error writing trades to ClickHouse: %s", e)
+        if "data" in locals() and data:
+            logger.error(
+                "Failed batch had %d rows. First row types: %s",
+                len(data),
+                [type(x).__name__ for x in data[0]],
+            )
+            logger.error("First row values: %s", data[0])
         raise
 
 
@@ -508,35 +726,59 @@ def run_writer():
             )
 
             if should_flush and (markets_buffer or events_buffer or trades_buffer):
+                logger.info("=" * 60)
                 logger.info("Flushing to ClickHouse...")
+                logger.info(
+                    "Buffer sizes - Markets: %d, Events: %d, Trades: %d",
+                    len(markets_buffer),
+                    len(events_buffer),
+                    len(trades_buffer),
+                )
 
                 # Write markets
                 if markets_buffer:
-                    count = write_markets_batch(client, markets_buffer)
-                    logger.info("✓ Wrote %d markets to ClickHouse", count)
-                    markets_buffer.clear()
+                    logger.info("Writing markets batch...")
+                    try:
+                        count = write_markets_batch(client, markets_buffer)
+                        logger.info("✓ Wrote %d markets to ClickHouse", count)
+                        markets_buffer.clear()
+                    except Exception as e:
+                        logger.error("Failed to write markets batch: %s", e)
+                        raise
 
                 # Write events
                 if events_buffer:
-                    count = write_events_batch(client, events_buffer)
-                    logger.info("✓ Wrote %d events to ClickHouse", count)
-                    events_buffer.clear()
+                    logger.info("Writing events batch...")
+                    try:
+                        count = write_events_batch(client, events_buffer)
+                        logger.info("✓ Wrote %d events to ClickHouse", count)
+                        events_buffer.clear()
+                    except Exception as e:
+                        logger.error("Failed to write events batch: %s", e)
+                        raise
 
                 # Write trades
                 if trades_buffer:
-                    count = write_trades_batch(client, trades_buffer)
-                    logger.info("✓ Wrote %d trades to ClickHouse", count)
-                    trades_buffer.clear()
+                    logger.info("Writing trades batch...")
+                    try:
+                        count = write_trades_batch(client, trades_buffer)
+                        logger.info("✓ Wrote %d trades to ClickHouse", count)
+                        trades_buffer.clear()
 
-                    # Acknowledge trades messages
-                    if trades_message_ids:
-                        queue.ack_messages(
-                            redis_config.TRADES_STREAM,
-                            redis_config.TRADES_GROUP,
-                            trades_message_ids,
-                        )
-                        trades_message_ids.clear()
+                        # Acknowledge trades messages
+                        if trades_message_ids:
+                            queue.ack_messages(
+                                redis_config.TRADES_STREAM,
+                                redis_config.TRADES_GROUP,
+                                trades_message_ids,
+                            )
+                            trades_message_ids.clear()
+                    except Exception as e:
+                        logger.error("Failed to write trades batch: %s", e)
+                        raise
 
+                logger.info("✓ Flush complete")
+                logger.info("=" * 60)
                 last_flush_time = time.time()
 
             # Periodic stream trimming (every 5 minutes)

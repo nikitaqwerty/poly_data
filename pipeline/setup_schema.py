@@ -60,8 +60,9 @@ def create_markets_table():
         volume Float64,
         ticker String,
         event_slug String,
-        closedTime Nullable(DateTime)
-    ) ENGINE = MergeTree()
+        closedTime Nullable(DateTime),
+        modifiedDateTime DateTime DEFAULT now()
+    ) ENGINE = ReplacingMergeTree(modifiedDateTime)
     ORDER BY (id, createdAt)
     """
 
@@ -97,8 +98,9 @@ def create_polymarket_events_table():
         closed Boolean,
         archived Boolean,
         volume Float64,
-        liquidity Float64
-    ) ENGINE = MergeTree()
+        liquidity Float64,
+        modifiedDateTime DateTime DEFAULT now()
+    ) ENGINE = ReplacingMergeTree(modifiedDateTime)
     ORDER BY (slug, id)
     """
 
@@ -130,8 +132,9 @@ def create_trades_table():
         price Float64,
         usd_amount Float64,
         token_amount Float64,
-        transactionHash String
-    ) ENGINE = MergeTree()
+        transactionHash String,
+        modifiedDateTime DateTime DEFAULT now()
+    ) ENGINE = ReplacingMergeTree(modifiedDateTime)
     PARTITION BY toYYYYMM(timestamp)
     ORDER BY (timestamp, market_id, transactionHash)
     """
