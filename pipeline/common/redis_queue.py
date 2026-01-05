@@ -255,6 +255,61 @@ class RedisQueue:
             logger.debug("Error getting pending count for %s: %s", stream_name, e)
             return 0
 
+    def claim_idle_messages(
+        self,
+        stream_name: str,
+        consumer_group: str,
+        consumer_name: str,
+        min_idle_time: int = 60000,
+        count: int = 100,
+    ) -> List[tuple]:
+        """
+        Claim idle pending messages from other consumers (e.g., dead consumers)
+
+        Args:
+            stream_name: Name of the stream
+            consumer_group: Consumer group name
+            consumer_name: This consumer's name
+            min_idle_time: Minimum idle time in milliseconds (default 60 seconds)
+            count: Maximum number of messages to claim
+
+        Returns:
+            List of (message_id, data_dict) tuples
+        """
+        try:
+            # Use XAUTOCLAIM to automatically claim idle messages
+            # Returns: (next_id, messages, deleted_ids)
+            result = self.client.xautoclaim(
+                name=stream_name,
+                groupname=consumer_group,
+                consumername=consumer_name,
+                min_idle_time=min_idle_time,
+                start_id="0-0",
+                count=count,
+            )
+
+            messages = []
+            if result and len(result) >= 2:
+                claimed_messages = result[1]
+                for message in claimed_messages:
+                    if isinstance(message, (list, tuple)) and len(message) == 2:
+                        message_id, message_data = message
+                        if message_data and "data" in message_data:
+                            data = json.loads(message_data["data"])
+                            messages.append((message_id, data))
+
+            if messages:
+                logger.info(
+                    "Claimed %d idle messages from stream %s",
+                    len(messages),
+                    stream_name,
+                )
+
+            return messages
+        except Exception as e:
+            logger.error("Error claiming idle messages from %s: %s", stream_name, e)
+            return []
+
     def trim_stream(self, stream_name: str, max_length: int = 10000):
         """
         Trim a stream to a maximum length (removes oldest messages)

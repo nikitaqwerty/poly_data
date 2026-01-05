@@ -438,8 +438,17 @@ def main():
         action="store_true",
         help="Skip loading markets",
     )
+    parser.add_argument(
+        "--trades-only",
+        action="store_true",
+        help="Load only trades (skip markets)",
+    )
 
     args = parser.parse_args()
+
+    # Handle --trades-only flag
+    if args.trades_only:
+        args.skip_markets = True
 
     logger.info("=" * 60)
     logger.info("📊 CSV to ClickHouse Loader")

@@ -398,6 +398,7 @@ def run_writer():
     markets_buffer = []
     events_buffer = []
     trades_buffer = []
+    trades_message_ids = []  # Track ALL message IDs in buffer, not just current batch
     last_flush_time = time.time()
     last_trim_time = time.time()
 
@@ -455,26 +456,48 @@ def run_writer():
                     len(events_buffer),
                 )
 
-            # Read from trades stream
-            trades_messages = queue.read_from_stream(
+            # First, try to claim idle pending messages from dead consumers
+            # This ensures we process messages that were delivered but never acknowledged
+            claimed_messages = queue.claim_idle_messages(
                 redis_config.TRADES_STREAM,
                 redis_config.TRADES_GROUP,
                 consumer_name,
+                min_idle_time=60000,  # Claim messages idle for >60 seconds
                 count=processing_config.clickhouse_writer_batch_size,
-                block=block_time,
             )
 
-            trades_message_ids = []
-            if trades_messages:
-                for msg_id, trade_data in trades_messages:
+            if claimed_messages:
+                for msg_id, trade_data in claimed_messages:
                     trades_buffer.append(trade_data)
                     trades_message_ids.append(msg_id)
-
                 logger.info(
-                    "Added %d trades to buffer (total: %d)",
-                    len(trades_messages),
+                    "Claimed %d idle trades (total buffer: %d)",
+                    len(claimed_messages),
                     len(trades_buffer),
                 )
+
+            # Then read new messages (only if we didn't get many claimed messages)
+            trades_messages = []
+            if len(claimed_messages) < processing_config.clickhouse_writer_batch_size:
+                trades_messages = queue.read_from_stream(
+                    redis_config.TRADES_STREAM,
+                    redis_config.TRADES_GROUP,
+                    consumer_name,
+                    count=processing_config.clickhouse_writer_batch_size,
+                    block=block_time,
+                )
+
+                # Append to existing message IDs (don't reset!)
+                if trades_messages:
+                    for msg_id, trade_data in trades_messages:
+                        trades_buffer.append(trade_data)
+                        trades_message_ids.append(msg_id)
+
+                    logger.info(
+                        "Added %d new trades to buffer (total: %d)",
+                        len(trades_messages),
+                        len(trades_buffer),
+                    )
 
             # Flush if buffer is large enough or max wait time exceeded
             should_flush = (
@@ -567,7 +590,12 @@ def run_writer():
                 last_trim_time = current_time
 
             # Small sleep if no data
-            if not markets_messages and not events_messages and not trades_messages:
+            if (
+                not markets_messages
+                and not events_messages
+                and not trades_messages
+                and not claimed_messages
+            ):
                 time.sleep(1)
 
     except KeyboardInterrupt:
