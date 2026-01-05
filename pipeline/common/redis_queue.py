@@ -234,6 +234,27 @@ class RedisQueue:
             logger.error("Error getting stream length: %s", e)
             return 0
 
+    def get_pending_count(self, stream_name: str, consumer_group: str) -> int:
+        """
+        Get the number of pending (unacknowledged) messages in a consumer group
+
+        Args:
+            stream_name: Name of the stream
+            consumer_group: Consumer group name
+
+        Returns:
+            Number of pending messages
+        """
+        try:
+            pending_info = self.client.xpending(stream_name, consumer_group)
+            if pending_info:
+                return pending_info["pending"]
+            return 0
+        except Exception as e:
+            # Consumer group might not exist yet
+            logger.debug("Error getting pending count for %s: %s", stream_name, e)
+            return 0
+
     def trim_stream(self, stream_name: str, max_length: int = 10000):
         """
         Trim a stream to a maximum length (removes oldest messages)

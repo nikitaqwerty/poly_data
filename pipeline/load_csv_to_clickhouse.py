@@ -17,8 +17,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from common.config import clickhouse_config
 from common.logging_config import setup_logging
+from common.redis_queue import RedisQueue
 
 logger = setup_logging("csv_loader")
+
+# State keys used by ingesters
+POLYMARKET_MARKETS_STATE_KEY = "polymarket_markets_offset"
+GOLDSKY_STATE_KEY = "goldsky_last_timestamp"
+POLYMARKET_EVENTS_STATE_KEY = "polymarket_events_offset"
 
 
 def get_clickhouse_client():
@@ -247,7 +253,7 @@ def load_markets_from_csv(csv_path: str, batch_size: int = 1000) -> int:
         return total_loaded
 
 
-def load_trades_from_csv(csv_path: str, batch_size: int = 5000) -> int:
+def load_trades_from_csv(csv_path: str, batch_size: int = 5000) -> tuple[int, int]:
     """
     Load trades from CSV file into ClickHouse
 
@@ -269,16 +275,17 @@ def load_trades_from_csv(csv_path: str, batch_size: int = 5000) -> int:
         batch_size: Number of records to insert per batch
 
     Returns:
-        Total number of records loaded
+        Tuple of (total_records_loaded, max_timestamp)
     """
     csv_file = Path(csv_path)
     if not csv_file.exists():
         logger.error("Trades CSV file not found: %s", csv_path)
-        return 0
+        return 0, 0
 
     client = get_clickhouse_client()
     total_loaded = 0
     batch = []
+    max_timestamp = 0
 
     logger.info("Loading trades from %s...", csv_path)
 
@@ -307,6 +314,11 @@ def load_trades_from_csv(csv_path: str, batch_size: int = 5000) -> int:
                     if not timestamp:
                         logger.warning("Row %d: Missing timestamp, skipping", row_num)
                         continue
+
+                    # Track max timestamp for Redis state
+                    timestamp_unix = int(timestamp.timestamp())
+                    if timestamp_unix > max_timestamp:
+                        max_timestamp = timestamp_unix
 
                     # Build row tuple
                     # Handle numeric fields - convert empty strings to 0
@@ -385,11 +397,12 @@ def load_trades_from_csv(csv_path: str, batch_size: int = 5000) -> int:
             total_loaded += len(batch)
 
         logger.info("✅ Total trades loaded: %d", total_loaded)
-        return total_loaded
+        logger.info("Max timestamp: %d", max_timestamp)
+        return total_loaded, max_timestamp
 
     except Exception as e:
         logger.error("Fatal error loading trades: %s", e, exc_info=True)
-        return total_loaded
+        return total_loaded, max_timestamp
 
 
 def main():
@@ -441,19 +454,56 @@ def main():
         # Create tables if needed
         create_tables_if_needed(client)
 
+        # Initialize Redis queue for state management
+        queue = RedisQueue()
+        logger.info("✓ Connected to Redis for state management")
+
         # Load markets
+        markets_count = 0
         if not args.skip_markets:
             logger.info("")
             logger.info("Loading markets from: %s", args.markets)
             markets_count = load_markets_from_csv(args.markets, args.batch_size)
             logger.info("Markets loaded: %d", markets_count)
 
+            # Set Redis state for polymarket markets ingester
+            if markets_count > 0:
+                queue.set_state(POLYMARKET_MARKETS_STATE_KEY, markets_count)
+                logger.info(
+                    "✓ Set Redis state '%s' = %d",
+                    POLYMARKET_MARKETS_STATE_KEY,
+                    markets_count,
+                )
+
         # Load trades
+        trades_count = 0
+        max_timestamp = 0
         if not args.skip_trades:
             logger.info("")
             logger.info("Loading trades from: %s", args.trades)
-            trades_count = load_trades_from_csv(args.trades, args.batch_size)
+            trades_count, max_timestamp = load_trades_from_csv(
+                args.trades, args.batch_size
+            )
             logger.info("Trades loaded: %d", trades_count)
+
+            # Set Redis state for goldsky ingester
+            if trades_count > 0 and max_timestamp > 0:
+                queue.set_state(GOLDSKY_STATE_KEY, max_timestamp)
+                logger.info(
+                    "✓ Set Redis state '%s' = %d",
+                    GOLDSKY_STATE_KEY,
+                    max_timestamp,
+                )
+
+        # Set polymarket events offset to 0 (events not typically loaded from CSV)
+        queue.set_state(POLYMARKET_EVENTS_STATE_KEY, 0)
+        logger.info(
+            "✓ Set Redis state '%s' = 0 (events not loaded from CSV)",
+            POLYMARKET_EVENTS_STATE_KEY,
+        )
+
+        # Close Redis connection
+        queue.close()
 
         logger.info("")
         logger.info("=" * 60)

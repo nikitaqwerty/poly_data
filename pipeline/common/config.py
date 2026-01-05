@@ -72,9 +72,11 @@ class ProcessingConfig:
     trade_processor_batch_size: int = 1000
     trade_processor_interval: int = 5  # seconds
 
-    clickhouse_writer_batch_size: int = 5000
+    # ClickHouse writer config - optimized for high throughput
+    # Read more messages per call to fill buffer faster
+    clickhouse_writer_batch_size: int = 50000  # ClickHouse handles large batches well
     clickhouse_writer_interval: int = 10  # seconds
-    clickhouse_writer_max_wait: int = 30  # max seconds to wait before flushing
+    clickhouse_writer_max_wait: int = 10  # Flush more frequently to reduce latency
 
 
 # Singleton instances

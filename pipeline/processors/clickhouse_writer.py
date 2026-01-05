@@ -72,6 +72,16 @@ def write_markets_batch(client, markets: List[Dict]) -> int:
                 else 0
             )
 
+            # Handle volume - convert to float, handling empty strings
+            volume_value = market.get("volume", 0)
+            if volume_value == "" or volume_value is None:
+                volume = 0.0
+            else:
+                try:
+                    volume = float(volume_value)
+                except (ValueError, TypeError):
+                    volume = 0.0
+
             row = (
                 created_at,
                 market_id,
@@ -83,7 +93,7 @@ def write_markets_batch(client, markets: List[Dict]) -> int:
                 str(market.get("token1", "")),
                 str(market.get("token2", "")),
                 str(market.get("condition_id", "")),
-                float(market.get("volume", 0)),
+                volume,
                 str(market.get("ticker", "")),
                 str(market.get("event_slug", "")),  # Added for joining with events
                 closed_time,
@@ -167,6 +177,31 @@ def write_events_batch(client, events: List[Dict]) -> int:
                 except:
                     pass
 
+            # Handle numeric fields - convert to proper types, handling empty strings
+            markets_count_value = event.get("markets_count", 0)
+            try:
+                markets_count = (
+                    int(markets_count_value)
+                    if markets_count_value not in ("", None)
+                    else 0
+                )
+            except (ValueError, TypeError):
+                markets_count = 0
+
+            volume_value = event.get("volume", 0)
+            try:
+                volume = float(volume_value) if volume_value not in ("", None) else 0.0
+            except (ValueError, TypeError):
+                volume = 0.0
+
+            liquidity_value = event.get("liquidity", 0)
+            try:
+                liquidity = (
+                    float(liquidity_value) if liquidity_value not in ("", None) else 0.0
+                )
+            except (ValueError, TypeError):
+                liquidity = 0.0
+
             row = (
                 str(event.get("id", "")),
                 str(event.get("slug", "")),
@@ -177,12 +212,12 @@ def write_events_batch(client, events: List[Dict]) -> int:
                 start_date,
                 end_date,
                 tags_list,
-                int(event.get("markets_count", 0)),
+                markets_count,
                 bool(event.get("active", False)),
                 bool(event.get("closed", False)),
                 bool(event.get("archived", False)),
-                float(event.get("volume", 0)),
-                float(event.get("liquidity", 0)),
+                volume,
+                liquidity,
             )
             data.append(row)
 
@@ -236,6 +271,33 @@ def write_trades_batch(client, trades: List[Dict]) -> int:
                 trade["timestamp"].replace("Z", "+00:00")
             )
 
+            # Handle numeric fields - convert to proper types, handling empty strings
+            price_value = trade.get("price", 0)
+            try:
+                price = float(price_value) if price_value not in ("", None) else 0.0
+            except (ValueError, TypeError):
+                price = 0.0
+
+            usd_amount_value = trade.get("usd_amount", 0)
+            try:
+                usd_amount = (
+                    float(usd_amount_value)
+                    if usd_amount_value not in ("", None)
+                    else 0.0
+                )
+            except (ValueError, TypeError):
+                usd_amount = 0.0
+
+            token_amount_value = trade.get("token_amount", 0)
+            try:
+                token_amount = (
+                    float(token_amount_value)
+                    if token_amount_value not in ("", None)
+                    else 0.0
+                )
+            except (ValueError, TypeError):
+                token_amount = 0.0
+
             row = (
                 timestamp,
                 str(trade.get("market_id", "")),
@@ -244,9 +306,9 @@ def write_trades_batch(client, trades: List[Dict]) -> int:
                 str(trade.get("nonusdc_side", "")),
                 str(trade.get("maker_direction", "")),
                 str(trade.get("taker_direction", "")),
-                float(trade.get("price", 0)),
-                float(trade.get("usd_amount", 0)),
-                float(trade.get("token_amount", 0)),
+                price,
+                usd_amount,
+                token_amount,
                 str(trade.get("transactionHash", "")),
             )
             data.append(row)
@@ -295,42 +357,98 @@ def run_writer():
 
     consumer_name = f"writer_{int(time.time())}"
 
+    # Check stream status but DO NOT trim automatically on startup
+    logger.info("Checking stream lengths...")
+
+    markets_length = queue.get_stream_length(redis_config.MARKETS_STREAM)
+    events_length = queue.get_stream_length(redis_config.POLYMARKET_EVENTS_STREAM)
+    order_events_length = queue.get_stream_length(redis_config.EVENTS_STREAM)
+    trades_length = queue.get_stream_length(redis_config.TRADES_STREAM)
+    trades_pending = queue.get_pending_count(
+        redis_config.TRADES_STREAM, redis_config.TRADES_GROUP
+    )
+
+    logger.info("Markets stream: %d messages", markets_length)
+    logger.info("Polymarket Events stream: %d messages", events_length)
+    logger.info("Order Events stream: %d messages", order_events_length)
+    logger.info(
+        "Trades stream: %d messages (%d pending/unwritten)",
+        trades_length,
+        trades_pending,
+    )
+
+    if trades_pending > 100000:
+        logger.warning(
+            "⚠️  Large backlog of %d pending trades! Processing with batch size %d.",
+            trades_pending,
+            processing_config.clickhouse_writer_batch_size,
+        )
+
+        # Calculate estimated time to clear backlog
+        estimated_batches = (
+            trades_pending / processing_config.clickhouse_writer_batch_size
+        )
+        estimated_minutes = (estimated_batches * 15) / 60  # ~15 sec per batch
+        logger.info(
+            "Estimated time to clear backlog: %.1f minutes (%.0f batches)",
+            estimated_minutes,
+            estimated_batches,
+        )
+
     markets_buffer = []
     events_buffer = []
     trades_buffer = []
     last_flush_time = time.time()
+    last_trim_time = time.time()
+
+    # Track last message IDs for simple reads to avoid skipping existing messages
+    markets_last_id = "0"  # Start from beginning
+    events_last_id = "0"  # Start from beginning
 
     try:
         while True:
             current_time = time.time()
             time_since_flush = current_time - last_flush_time
 
-            # Read from markets stream
+            # Adaptive blocking: if buffers are large, don't block (read fast)
+            # If buffers are small, block briefly to avoid busy-waiting
+            buffer_has_data = (
+                len(markets_buffer) > 1000
+                or len(events_buffer) > 1000
+                or len(trades_buffer) > 1000
+            )
+            block_time = 100 if buffer_has_data else 1000  # 100ms vs 1s
+
+            # Read from markets stream (track position to not skip existing messages)
             markets_messages = queue.read_from_stream_simple(
                 redis_config.MARKETS_STREAM,
-                last_id="$",  # Only new messages
+                last_id=markets_last_id,
                 count=processing_config.clickhouse_writer_batch_size,
-                block=1000,
+                block=block_time,
             )
 
             if markets_messages:
                 markets_buffer.extend([data for _, data in markets_messages])
+                # Update last read ID
+                markets_last_id = markets_messages[-1][0]
                 logger.info(
                     "Added %d markets to buffer (total: %d)",
                     len(markets_messages),
                     len(markets_buffer),
                 )
 
-            # Read from polymarket events stream
+            # Read from polymarket events stream (track position to not skip existing messages)
             events_messages = queue.read_from_stream_simple(
                 redis_config.POLYMARKET_EVENTS_STREAM,
-                last_id="$",  # Only new messages
+                last_id=events_last_id,
                 count=processing_config.clickhouse_writer_batch_size,
-                block=1000,
+                block=block_time,
             )
 
             if events_messages:
                 events_buffer.extend([data for _, data in events_messages])
+                # Update last read ID
+                events_last_id = events_messages[-1][0]
                 logger.info(
                     "Added %d events to buffer (total: %d)",
                     len(events_messages),
@@ -343,7 +461,7 @@ def run_writer():
                 redis_config.TRADES_GROUP,
                 consumer_name,
                 count=processing_config.clickhouse_writer_batch_size,
-                block=1000,
+                block=block_time,
             )
 
             trades_message_ids = []
@@ -398,9 +516,55 @@ def run_writer():
 
                 last_flush_time = time.time()
 
-            # Periodic stream trimming
-            if int(current_time) % 300 == 0:  # Every 5 minutes
-                queue.trim_stream(redis_config.TRADES_STREAM, max_length=50000)
+            # Periodic stream trimming (every 5 minutes)
+            # Only trim streams that are safe (data already written to ClickHouse)
+            time_since_trim = current_time - last_trim_time
+            if time_since_trim >= 300:  # 5 minutes
+                logger.info("Checking streams for safe trimming...")
+
+                # For TRADES stream, check pending count before trimming
+                trades_pending_count = queue.get_pending_count(
+                    redis_config.TRADES_STREAM, redis_config.TRADES_GROUP
+                )
+                trades_total = queue.get_stream_length(redis_config.TRADES_STREAM)
+
+                # Only trim if we have acknowledged messages (total - pending > 50k)
+                if trades_total - trades_pending_count > 50000:
+                    logger.info(
+                        "TRADES: %d total, %d pending. Trimming acknowledged messages...",
+                        trades_total,
+                        trades_pending_count,
+                    )
+                    queue.trim_stream(redis_config.TRADES_STREAM, max_length=50000)
+                else:
+                    logger.info(
+                        "TRADES: %d total, %d pending. Not trimming (would lose data)",
+                        trades_total,
+                        trades_pending_count,
+                    )
+
+                # For MARKETS and EVENTS, we track our position with last_id
+                # These can be trimmed safely since we've read them
+                markets_len = queue.get_stream_length(redis_config.MARKETS_STREAM)
+                if (
+                    markets_len > 100000
+                ):  # Higher threshold since we're tracking position
+                    logger.info("Trimming MARKETS stream (%d messages)...", markets_len)
+                    queue.trim_stream(redis_config.MARKETS_STREAM, max_length=50000)
+
+                events_len = queue.get_stream_length(
+                    redis_config.POLYMARKET_EVENTS_STREAM
+                )
+                if events_len > 100000:
+                    logger.info(
+                        "Trimming POLYMARKET_EVENTS stream (%d messages)...", events_len
+                    )
+                    queue.trim_stream(
+                        redis_config.POLYMARKET_EVENTS_STREAM, max_length=50000
+                    )
+
+                logger.info("✓ Safe trimming complete")
+                last_trim_time = current_time
 
             # Small sleep if no data
             if not markets_messages and not events_messages and not trades_messages:

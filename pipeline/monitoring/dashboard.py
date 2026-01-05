@@ -58,12 +58,20 @@ async def root():
     queue = RedisQueue()
 
     # Get stream lengths
-    markets_pending = queue.get_stream_length(redis_config.MARKETS_STREAM)
-    polymarket_events_pending = queue.get_stream_length(
+    markets_length = queue.get_stream_length(redis_config.MARKETS_STREAM)
+    polymarket_events_length = queue.get_stream_length(
         redis_config.POLYMARKET_EVENTS_STREAM
     )
-    order_events_pending = queue.get_stream_length(redis_config.EVENTS_STREAM)
-    trades_pending = queue.get_stream_length(redis_config.TRADES_STREAM)
+    order_events_length = queue.get_stream_length(redis_config.EVENTS_STREAM)
+    trades_length = queue.get_stream_length(redis_config.TRADES_STREAM)
+
+    # Get pending counts for consumer group streams
+    order_events_pending = queue.get_pending_count(
+        redis_config.EVENTS_STREAM, redis_config.EVENTS_GROUP
+    )
+    trades_pending = queue.get_pending_count(
+        redis_config.TRADES_STREAM, redis_config.TRADES_GROUP
+    )
 
     # Get state
     polymarket_markets_offset = queue.get_state("polymarket_markets_offset", 0)
@@ -135,20 +143,20 @@ async def root():
         <div class="card">
             <div class="section-title">Redis Streams Status</div>
             <div class="stat">
-                <span class="label">Markets Stream (pending)</span>
-                <span class="value">{markets_pending:,}</span>
+                <span class="label">Markets Stream (total messages)</span>
+                <span class="value">{markets_length:,}</span>
             </div>
             <div class="stat">
-                <span class="label">Polymarket Events Stream (pending)</span>
-                <span class="value">{polymarket_events_pending:,}</span>
+                <span class="label">Polymarket Events Stream (total messages)</span>
+                <span class="value">{polymarket_events_length:,}</span>
             </div>
             <div class="stat">
-                <span class="label">Order Events Stream (pending)</span>
-                <span class="value">{order_events_pending:,}</span>
+                <span class="label">Order Events Stream (total / pending)</span>
+                <span class="value">{order_events_length:,} / {order_events_pending:,}</span>
             </div>
             <div class="stat">
-                <span class="label">Trades Stream (pending)</span>
-                <span class="value">{trades_pending:,}</span>
+                <span class="label">Trades Stream (total / pending)</span>
+                <span class="value">{trades_length:,} / {trades_pending:,}</span>
             </div>
         </div>
         
@@ -218,12 +226,24 @@ async def api_status():
 
     status = {
         "redis_streams": {
-            "markets": queue.get_stream_length(redis_config.MARKETS_STREAM),
-            "polymarket_events": queue.get_stream_length(
-                redis_config.POLYMARKET_EVENTS_STREAM
-            ),
-            "order_events": queue.get_stream_length(redis_config.EVENTS_STREAM),
-            "trades": queue.get_stream_length(redis_config.TRADES_STREAM),
+            "markets": {
+                "total": queue.get_stream_length(redis_config.MARKETS_STREAM),
+            },
+            "polymarket_events": {
+                "total": queue.get_stream_length(redis_config.POLYMARKET_EVENTS_STREAM),
+            },
+            "order_events": {
+                "total": queue.get_stream_length(redis_config.EVENTS_STREAM),
+                "pending": queue.get_pending_count(
+                    redis_config.EVENTS_STREAM, redis_config.EVENTS_GROUP
+                ),
+            },
+            "trades": {
+                "total": queue.get_stream_length(redis_config.TRADES_STREAM),
+                "pending": queue.get_pending_count(
+                    redis_config.TRADES_STREAM, redis_config.TRADES_GROUP
+                ),
+            },
         },
         "state": {
             "polymarket_markets_offset": queue.get_state(

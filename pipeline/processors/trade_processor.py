@@ -173,8 +173,21 @@ def run_processor():
     logger.info("Loading markets cache...")
     load_markets_from_clickhouse()
 
+    # Check EVENTS_STREAM status but don't trim automatically
+    events_length = queue.get_stream_length(redis_config.EVENTS_STREAM)
+    events_pending = queue.get_pending_count(redis_config.EVENTS_STREAM, redis_config.EVENTS_GROUP)
+    
+    logger.info("EVENTS_STREAM: %d messages (%d pending)", events_length, events_pending)
+    
+    if events_pending > 100000:
+        logger.warning(
+            "⚠️  Large backlog of %d pending order events! May take time to process.",
+            events_pending
+        )
+
     try:
         batch_count = 0
+        last_trim_time = time.time()
 
         while True:
             # Reload markets cache periodically
@@ -221,9 +234,31 @@ def run_processor():
 
             batch_count += 1
 
-            # Periodic stream trimming to prevent unbounded growth
-            if batch_count % 100 == 0:
-                queue.trim_stream(redis_config.EVENTS_STREAM, max_length=50000)
+            # Periodic stream trimming to prevent unbounded growth (every 5 minutes)
+            # Only trim acknowledged messages to avoid data loss
+            current_time = time.time()
+            time_since_trim = current_time - last_trim_time
+            if time_since_trim >= 300:  # 5 minutes
+                events_total = queue.get_stream_length(redis_config.EVENTS_STREAM)
+                events_pending_count = queue.get_pending_count(
+                    redis_config.EVENTS_STREAM, redis_config.EVENTS_GROUP
+                )
+                
+                # Only trim if we have lots of acknowledged messages
+                if events_total - events_pending_count > 50000:
+                    logger.info(
+                        "EVENTS_STREAM: %d total, %d pending. Trimming acknowledged messages...",
+                        events_total, events_pending_count
+                    )
+                    queue.trim_stream(redis_config.EVENTS_STREAM, max_length=50000)
+                    logger.info("✓ Trimmed EVENTS_STREAM")
+                else:
+                    logger.debug(
+                        "EVENTS_STREAM: %d total, %d pending. Not trimming (would lose data)",
+                        events_total, events_pending_count
+                    )
+                
+                last_trim_time = current_time
 
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down...")
