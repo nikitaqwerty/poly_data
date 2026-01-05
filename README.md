@@ -85,7 +85,7 @@ Market metadata including:
 - Trading volume and condition IDs
 - Negative risk indicators
 
-**Fields**: `createdAt`, `id`, `question`, `answer1`, `answer2`, `neg_risk`, `market_slug`, `token1`, `token2`, `condition_id`, `volume`, `ticker`, `closedTime`
+**Fields**: `createdAt`, `id`, `question`, `answer1`, `answer2`, `neg_risk`, `market_slug`, `token1`, `token2`, `condition_id`, `volume`, `ticker`, `closedTime`, `event_slug`, `tags`
 
 ### goldsky/orderFilled.csv
 Raw order-filled events with:
@@ -107,17 +107,47 @@ Structured trade data including:
 
 ### 1. Update Markets (`update_markets.py`)
 
-Fetches all markets from Polymarket API in chronological order.
+Fetches all markets from Polymarket API in chronological order, including event slugs and tags.
 
 **Features**:
 - Automatic resume from last offset (idempotent)
 - Rate limiting and error handling
 - Batch fetching (500 markets per request)
+- Fetches event slugs and tags for each market
 
 **Usage**:
 ```bash
 uv run python -c "from update_utils.update_markets import update_markets; update_markets()"
 ```
+
+#### Backfill Event Tags (`backfill_event_tags.py`)
+
+If you have existing markets.csv data without `event_slug` and `tags` fields, use this script to populate them.
+
+**Features**:
+- Reads existing CSV and populates missing event_slug and tags
+- Smart caching to avoid duplicate API calls
+- Progress tracking with checkpoints every 100 rows
+- Resume capability if interrupted
+- Safe operation (writes to new file, preserves original)
+
+**Usage**:
+```bash
+# Process entire CSV
+uv run python backfill_event_tags.py
+
+# Resume from specific row (if interrupted)
+uv run python backfill_event_tags.py 5000
+
+# After completion, replace original (optional)
+mv markets_updated.csv markets.csv
+```
+
+**What it does**:
+- Skips rows that already have both event_slug and tags
+- For rows missing event_slug: fetches from `/markets/{slug}` endpoint
+- For rows with event_slug but no tags: fetches from `/events` endpoint
+- Outputs to `markets_updated.csv` (doesn't modify original)
 
 ### 2. Update Goldsky (`update_goldsky.py`)
 
@@ -342,7 +372,9 @@ CREATE TABLE polymarket.markets (
     condition_id String,
     volume Float64,
     ticker String,
-    closedTime Nullable(DateTime64(3))
+    closedTime Nullable(DateTime64(3)),
+    event_slug String,
+    tags String
 ) ENGINE = MergeTree()
 ORDER BY (createdAt, id);
 ```

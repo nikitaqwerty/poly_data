@@ -62,6 +62,17 @@ def load_new_markets(batch_size: int = 10000):
     # Ensure boolean column
     new_markets = new_markets.with_columns([pl.col("neg_risk").cast(pl.Boolean)])
 
+    # Parse tags from semicolon-separated string to array
+    # Handle missing or empty tags gracefully
+    new_markets = new_markets.with_columns(
+        [
+            pl.when(pl.col("tags").is_not_null() & (pl.col("tags") != ""))
+            .then(pl.col("tags").str.split(";"))
+            .otherwise(pl.lit([]))
+            .alias("tags")
+        ]
+    )
+
     # Insert in batches
     total_inserted = 0
     for i in range(0, len(new_markets), batch_size):
@@ -82,6 +93,8 @@ def load_new_markets(batch_size: int = 10000):
                 float(row["volume"]) if row["volume"] else 0.0,
                 str(row["ticker"]) if row["ticker"] is not None else "",
                 row["closedTime"],
+                str(row["event_slug"]) if row["event_slug"] is not None else "",
+                row["tags"] if row["tags"] is not None else [],
             )
             for row in batch.iter_rows(named=True)
         ]
@@ -103,6 +116,8 @@ def load_new_markets(batch_size: int = 10000):
                 "volume",
                 "ticker",
                 "closedTime",
+                "event_slug",
+                "tags",
             ],
         )
 

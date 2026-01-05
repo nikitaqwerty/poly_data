@@ -1,0 +1,84 @@
+"""Configuration for the pipeline"""
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+
+from dotenv import load_dotenv
+
+env_path = Path(__file__).parent.parent / ".env"
+load_dotenv(env_path)
+
+
+@dataclass
+class RedisConfig:
+    """Redis connection configuration"""
+
+    host: str = os.getenv("REDIS_HOST", "localhost")
+    port: int = int(os.getenv("REDIS_PORT", 6379))
+    db: int = int(os.getenv("REDIS_DB", 0))
+    password: str = os.getenv("REDIS_PASSWORD", "")
+
+    # Stream and key names
+    MARKETS_STREAM = "stream:markets"
+    POLYMARKET_EVENTS_STREAM = "stream:polymarket_events"
+    EVENTS_STREAM = "stream:order_events"
+    TRADES_STREAM = "stream:trades"
+
+    # Consumer groups
+    MARKETS_GROUP = "markets_writers"
+    POLYMARKET_EVENTS_GROUP = "polymarket_events_writers"
+    EVENTS_GROUP = "events_processors"
+    TRADES_GROUP = "trades_writers"
+
+    # State keys
+    STATE_PREFIX = "state:"
+
+
+@dataclass
+class ClickHouseConfig:
+    """ClickHouse connection configuration"""
+
+    host: str = os.getenv("CLICKHOUSE_HOST", "localhost")
+    port: int = int(os.getenv("CLICKHOUSE_PORT", 8123))
+    user: str = os.getenv("CLICKHOUSE_USER", "default")
+    password: str = os.getenv("CLICKHOUSE_PASSWORD", "")
+    database: str = os.getenv("CLICKHOUSE_DATABASE", "polymarket")
+
+
+@dataclass
+class APIConfig:
+    """API endpoints and configuration"""
+
+    polymarket_markets_url: str = "https://gamma-api.polymarket.com/markets"
+    polymarket_events_url: str = "https://gamma-api.polymarket.com/events"
+    goldsky_url: str = (
+        "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
+    )
+
+    # Rate limiting and batch sizes
+    polymarket_batch_size: int = 500
+    polymarket_poll_interval: int = 30  # seconds
+    goldsky_batch_size: int = 1000
+    goldsky_poll_interval: int = 5  # seconds
+    request_timeout: int = 30  # seconds
+
+
+@dataclass
+class ProcessingConfig:
+    """Processing configuration"""
+
+    trade_processor_batch_size: int = 1000
+    trade_processor_interval: int = 5  # seconds
+
+    clickhouse_writer_batch_size: int = 5000
+    clickhouse_writer_interval: int = 10  # seconds
+    clickhouse_writer_max_wait: int = 30  # max seconds to wait before flushing
+
+
+# Singleton instances
+redis_config = RedisConfig()
+clickhouse_config = ClickHouseConfig()
+api_config = APIConfig()
+processing_config = ProcessingConfig()

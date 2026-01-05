@@ -16,6 +16,8 @@ dependencies = [
     "gql[requests]>=3.4.0",
     "flatten-json>=0.1.13",
     "clickhouse-connect>=0.7.0",
+    "tqdm>=4.67.1",
+    "python-dotenv>=1.0.1",
 ]
 
 [project.optional-dependencies]

@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DATABASE}.markets
     condition_id String,
     volume Float64,
     ticker String,
-    closedTime Nullable(DateTime64(3))
+    closedTime Nullable(DateTime64(3)),
+    event_slug String
 )
 ENGINE = MergeTree()
 ORDER BY (createdAt, id)
@@ -63,6 +64,30 @@ ORDER BY (timestamp, market_id, transactionHash)
 SETTINGS index_granularity = 8192
 """
 
+POLYMARKET_EVENTS_TABLE_DDL = f"""
+CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DATABASE}.polymarket_events
+(
+    id String,
+    slug String,
+    ticker String,
+    title String,
+    description String,
+    createdAt Nullable(DateTime64(3)),
+    startDate Nullable(DateTime64(3)),
+    endDate Nullable(DateTime64(3)),
+    tags Array(LowCardinality(String)),
+    markets_count UInt32,
+    active Boolean,
+    closed Boolean,
+    archived Boolean,
+    volume Float64,
+    liquidity Float64
+)
+ENGINE = MergeTree()
+ORDER BY (slug, id)
+SETTINGS index_granularity = 8192
+"""
+
 
 def create_database():
     """
@@ -87,6 +112,7 @@ def create_tables():
 
     tables = {
         "markets": MARKETS_TABLE_DDL,
+        "polymarket_events": POLYMARKET_EVENTS_TABLE_DDL,
         "order_filled": ORDER_FILLED_TABLE_DDL,
         "trades": TRADES_TABLE_DDL,
     }
@@ -185,7 +211,7 @@ def initialize_schema():
 
     # Print current row counts
     print("\nCurrent table status:")
-    for table in ["markets", "order_filled", "trades"]:
+    for table in ["markets", "polymarket_events", "order_filled", "trades"]:
         try:
             count = get_table_count(table)
             print(f"  {table}: {count:,} rows")

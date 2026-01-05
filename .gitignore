@@ -1,4 +1,7 @@
 markets.csv
+markets_updated.csv
+markets.csv.backup
+*.csv.backup
 processed/
 goldsky/
 # Byte-compiled / optimized / DLL files

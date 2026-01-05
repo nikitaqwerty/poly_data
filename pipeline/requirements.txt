@@ -1,0 +1,22 @@
+# Redis-based Real-time Pipeline Requirements
+
+# Redis client
+redis==5.0.1
+
+# HTTP clients and API
+requests==2.31.0
+gql[requests]==3.5.0
+
+# ClickHouse
+clickhouse-connect==0.7.0
+
+# Data processing (optional for trade processor)
+polars==0.20.3
+
+# Web framework for monitoring
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# Utilities
+python-dateutil==2.8.2
+python-dotenv==1.0.0

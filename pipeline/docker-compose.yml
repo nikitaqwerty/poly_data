@@ -1,0 +1,143 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: pipeline-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: pipeline-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    environment:
+      - CLICKHOUSE_DB=polymarket
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=clickhouse123
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  polymarket-markets-ingester:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-markets-ingester
+    command: python3 ingesters/polymarket_ingester.py
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CLICKHOUSE_HOST=clickhouse
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  polymarket-events-ingester:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-events-ingester
+    command: python3 ingesters/polymarket_events_ingester.py
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  goldsky-ingester:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: goldsky-ingester
+    command: python3 ingesters/goldsky_ingester.py
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  trade-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trade-processor
+    command: python3 processors/trade_processor.py
+    depends_on:
+      - redis
+      - clickhouse
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  clickhouse-writer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: clickhouse-writer
+    command: python3 processors/clickhouse_writer.py
+    depends_on:
+      - redis
+      - clickhouse
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DATABASE=polymarket
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  monitoring:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pipeline-monitoring
+    command: python3 monitoring/dashboard.py
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - clickhouse
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  clickhouse-data:

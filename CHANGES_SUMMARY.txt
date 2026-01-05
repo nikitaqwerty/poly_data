@@ -1,0 +1,189 @@
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                                                                               ║
+║                        PIPELINE UPDATE - SUMMARY                              ║
+║                                                                               ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+📝 CHANGE REQUEST
+═══════════════════════════════════════════════════════════════════════════════
+
+Remove the order_filled table from ClickHouse - only keep the final trades table.
+
+
+✅ CHANGES MADE
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Updated setup_schema.py
+   - Removed create_order_filled_table() function
+   - Removed call to create order_filled table in main()
+   - Now only creates: markets + trades tables
+
+2. Updated test_setup.py
+   - Changed table check list from 3 tables to 2 tables
+   - Now checks: ["markets", "trades"]
+
+3. Updated monitoring/dashboard.py
+   - Changed ClickHouse stats to only query 2 tables
+   - Removed order_filled from table list
+
+4. Updated README.md
+   - Updated documentation to reflect 2 tables only
+   - Added section explaining the two ClickHouse tables
+
+
+📊 CURRENT ARCHITECTURE
+═══════════════════════════════════════════════════════════════════════════════
+
+Data Flow:
+  Polymarket API → Ingester → Redis: stream:markets → Writer → CH: markets
+  
+  Goldsky API → Ingester → Redis: stream:order_events 
+                                  ↓
+                            Trade Processor
+                                  ↓
+                           Redis: stream:trades → Writer → CH: trades
+
+ClickHouse Tables (2 total):
+  ✓ markets          (market information)
+  ✓ trades           (processed trades)
+  ✗ order_filled     (REMOVED - not needed)
+
+
+🎯 RATIONALE
+═══════════════════════════════════════════════════════════════════════════════
+
+The order_filled table was redundant because:
+  • Raw order events flow through Redis Streams
+  • Trade processor transforms events → trades in real-time
+  • Final output (trades table) contains all needed information
+  • No need to store intermediate/raw order events in ClickHouse
+  • Saves storage space and simplifies schema
+
+
+✅ VERIFICATION
+═══════════════════════════════════════════════════════════════════════════════
+
+To verify the changes:
+
+1. Run schema setup:
+   $ python3 pipeline/setup_schema.py
+   
+   Should create only 2 tables:
+   ✓ Table 'markets' ready
+   ✓ Table 'trades' ready
+
+2. Run setup test:
+   $ python3 pipeline/test_setup.py
+   
+   Should check only 2 tables:
+   ✓ Table 'markets': EXISTS
+   ✓ Table 'trades': EXISTS
+
+3. Check monitoring dashboard:
+   → http://localhost:8000
+   
+   Should show only 2 tables in ClickHouse section
+
+
+📂 FILES MODIFIED
+═══════════════════════════════════════════════════════════════════════════════
+
+✓ pipeline/setup_schema.py          (removed order_filled table creation)
+✓ pipeline/test_setup.py            (updated table check list)
+✓ pipeline/monitoring/dashboard.py  (updated stats query)
+✓ pipeline/README.md                (updated documentation)
+
+
+🔄 NO CHANGES NEEDED
+═══════════════════════════════════════════════════════════════════════════════
+
+These files were already correct:
+  ✓ clickhouse_writer.py   (already only writes markets + trades)
+  ✓ trade_processor.py     (processes events → trades in Redis)
+  ✓ Redis Streams          (events stream is temporary/in-memory)
+
+
+🎉 RESULT
+═══════════════════════════════════════════════════════════════════════════════
+
+The pipeline now has a cleaner architecture:
+  • 2 ClickHouse tables (markets + trades)
+  • Raw order events only exist in Redis Streams (temporary)
+  • Processor transforms events → trades in real-time
+  • ClickHouse stores only final, processed data
+
+Benefits:
+  ✓ Simpler schema (2 tables vs 3)
+  ✓ Less storage used
+  ✓ Cleaner data model
+  ✓ Same functionality maintained
+
+═══════════════════════════════════════════════════════════════════════════════
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📝 ADDITIONAL CHANGE
+═══════════════════════════════════════════════════════════════════════════════
+
+Removed event_slug column from markets table.
+
+
+✅ CHANGES MADE
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Updated setup_schema.py
+   - Removed event_slug column from markets table schema
+
+2. Updated processors/clickhouse_writer.py
+   - Removed event_slug from row construction
+   - Removed event_slug from column_names list
+
+3. Updated ingesters/polymarket_ingester.py
+   - Still fetches event_slug temporarily to get tags
+   - But no longer includes event_slug in return dictionary
+   - Comment added explaining event_slug is only used for tags lookup
+
+
+📊 FINAL MARKETS TABLE SCHEMA
+═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE polymarket.markets (
+    createdAt DateTime,
+    id String,
+    question String,
+    answer1 String,
+    answer2 String,
+    neg_risk Boolean,
+    market_slug String,
+    token1 String,
+    token2 String,
+    condition_id String,
+    volume Float64,
+    ticker String,
+    closedTime Nullable(DateTime),
+    tags Array(String)
+) ENGINE = ReplacingMergeTree()
+ORDER BY (id, createdAt)
+
+
+🎯 RATIONALE
+═══════════════════════════════════════════════════════════════════════════════
+
+event_slug was redundant because:
+  • Only used internally to fetch tags from events API
+  • Not needed for queries or analysis
+  • tags array already contains the enriched data we need
+  • Simplifies schema
+
+
+✅ FINAL RESULT
+═══════════════════════════════════════════════════════════════════════════════
+
+ClickHouse Schema:
+  ✓ markets table: 14 columns (was 15)
+  ✓ trades table: 11 columns (unchanged)
+
+Total: 2 tables, 25 columns (was 26)
+
+═══════════════════════════════════════════════════════════════════════════════

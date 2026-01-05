@@ -40,6 +40,8 @@ def load_markets(
             schema_overrides={
                 "token1": pl.Utf8,
                 "token2": pl.Utf8,
+                "event_slug": pl.Utf8,
+                "tags": pl.Utf8,
             },
         )
         dfs.append(df)
@@ -52,6 +54,8 @@ def load_markets(
             schema_overrides={
                 "token1": pl.Utf8,
                 "token2": pl.Utf8,
+                "event_slug": pl.Utf8,
+                "tags": pl.Utf8,
             },
         )
         dfs.append(df)
@@ -85,6 +89,17 @@ def load_markets(
     # Ensure boolean column
     df = df.with_columns([pl.col("neg_risk").cast(pl.Boolean)])
 
+    # Parse tags from semicolon-separated string to array
+    # Handle missing or empty tags gracefully
+    df = df.with_columns(
+        [
+            pl.when(pl.col("tags").is_not_null() & (pl.col("tags") != ""))
+            .then(pl.col("tags").str.split(";"))
+            .otherwise(pl.lit([]))
+            .alias("tags")
+        ]
+    )
+
     # Convert to list of tuples for insertion
     print(f"\n⚙️  Inserting {len(df):,} rows in batches of {batch_size:,}...")
 
@@ -108,6 +123,8 @@ def load_markets(
                 float(row["volume"]) if row["volume"] else 0.0,
                 str(row["ticker"]) if row["ticker"] is not None else "",
                 row["closedTime"],
+                str(row["event_slug"]) if row["event_slug"] is not None else "",
+                row["tags"] if row["tags"] is not None else [],
             )
             for row in batch.iter_rows(named=True)
         ]
@@ -129,6 +146,8 @@ def load_markets(
                 "volume",
                 "ticker",
                 "closedTime",
+                "event_slug",
+                "tags",
             ],
         )
 

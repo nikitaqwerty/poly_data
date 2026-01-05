@@ -20,6 +20,44 @@ def count_csv_lines(csv_filename: str) -> int:
         return 0
 
 
+def fetch_event_tags(event_slug: str, event_cache: Dict) -> List[str]:
+    """
+    Fetch tags for a given event slug from the /events endpoint.
+    Uses caching to avoid duplicate API calls.
+
+    Args:
+        event_slug: The slug of the event to fetch
+        event_cache: Dictionary to cache event data
+
+    Returns:
+        List of tag labels for the event
+    """
+    if event_slug in event_cache:
+        return event_cache[event_slug]
+
+    if not event_slug:
+        event_cache[event_slug] = []
+        return []
+
+    try:
+        url = f"https://gamma-api.polymarket.com/events?slug={event_slug}"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code == 200:
+            events = response.json()
+            if events and len(events) > 0:
+                event = events[0]
+                tags = event.get("tags", [])
+                tag_labels = [tag.get("label", "") for tag in tags if tag.get("label")]
+                event_cache[event_slug] = tag_labels
+                return tag_labels
+    except Exception as e:
+        print(f"Error fetching event tags for {event_slug}: {e}")
+
+    event_cache[event_slug] = []
+    return []
+
+
 def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
     """
     Fetch markets ordered by creation date and save to CSV.
@@ -31,6 +69,9 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
     """
 
     base_url = "https://gamma-api.polymarket.com/markets"
+
+    # Cache for event tags to avoid duplicate API calls
+    event_cache = {}
 
     # CSV headers for the required columns
     headers = [
@@ -47,6 +88,8 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
         "volume",
         "ticker",
         "closedTime",
+        "event_slug",
+        "tags",
     ]
 
     # Dynamically set offset based on existing records
@@ -147,10 +190,21 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                             "title", ""
                         )
 
-                        # Get ticker from events if available
+                        # Get ticker and event_slug from events if available
                         ticker = ""
+                        event_slug = ""
                         if market.get("events") and len(market.get("events", [])) > 0:
                             ticker = market["events"][0].get("ticker", "")
+                            event_slug = market["events"][0].get("slug", "")
+
+                        # Fetch tags from the /events endpoint
+                        # Tags are not included in the /markets endpoint response
+                        tags_list = []
+                        if event_slug:
+                            tags_list = fetch_event_tags(event_slug, event_cache)
+
+                        # Join tags with semicolon separator
+                        tags_str = ";".join(tags_list) if tags_list else ""
 
                         row = [
                             market.get("createdAt", ""),
@@ -166,6 +220,8 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                             market.get("volume", ""),
                             ticker,
                             market.get("closedTime", ""),
+                            event_slug,
+                            tags_str,
                         ]
 
                         writer.writerow(row)

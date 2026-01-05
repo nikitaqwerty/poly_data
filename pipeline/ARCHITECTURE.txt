@@ -1,0 +1,288 @@
+"""
+PIPELINE ARCHITECTURE OVERVIEW
+===============================
+
+Real-time Data Pipeline for Polymarket
+Built with Redis Streams + Python + ClickHouse
+
+
+COMPONENT DIAGRAM
+=================
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                         EXTERNAL DATA SOURCES                        │
+├──────────────────────────────┬──────────────────────────────────────┤
+│   Polymarket REST API        │   Goldsky GraphQL API                │
+│   - Markets data             │   - Order filled events              │
+│   - Paginated with offset    │   - Time-series data                 │
+└──────────────┬───────────────┴────────────┬─────────────────────────┘
+               │                            │
+               │ HTTP Polling               │ GraphQL Polling
+               │ (30s interval)             │ (5s interval)
+               │                            │
+┌──────────────▼───────────────┐  ┌────────▼─────────────────────────┐
+│  Polymarket Ingester         │  │  Goldsky Ingester                │
+│  (polymarket_ingester.py)    │  │  (goldsky_ingester.py)           │
+├──────────────────────────────┤  ├──────────────────────────────────┤
+│  - Fetch markets by offset   │  │  - Fetch events by timestamp     │
+│  - Enrich with tags          │  │  - Sort by timestamp             │
+│  - Track offset in Redis     │  │  - Track watermark in Redis      │
+│  - Push to stream            │  │  - Push to stream                │
+└──────────────┬───────────────┘  └────────┬─────────────────────────┘
+               │                            │
+               │ push_batch()               │ push_batch()
+               │                            │
+               │                            │
+┌──────────────▼────────────────────────────▼─────────────────────────┐
+│                          REDIS STREAMS                               │
+├──────────────────────────────┬──────────────────────────────────────┤
+│  stream:markets              │  stream:order_events                 │
+│  - Markets data              │  - Raw order events                  │
+│  - Consumed by writer        │  - Consumed by processor             │
+└──────────────┬───────────────┴──────────────┬───────────────────────┘
+               │                               │
+               │                               │ read_from_stream()
+               │                               │ (Consumer Group)
+               │                               │
+               │                      ┌────────▼─────────────────────┐
+               │                      │  Trade Processor             │
+               │                      │  (trade_processor.py)        │
+               │                      ├──────────────────────────────┤
+               │                      │  - Match with markets        │
+               │                      │  - Calculate prices          │
+               │                      │  - Determine direction       │
+               │                      │  - Push processed trades     │
+               │                      └────────┬─────────────────────┘
+               │                               │
+               │                               │ push_batch()
+               │                               │
+               │              ┌────────────────▼─────────────────────┐
+               │              │  stream:trades                       │
+               │              │  - Processed trade data              │
+               │              │  - Consumed by writer                │
+               │              └────────┬─────────────────────────────┘
+               │                       │
+               │ read_simple()         │ read_from_stream()
+               │                       │ (Consumer Group)
+               │                       │
+┌──────────────▼───────────────────────▼─────────────────────────────┐
+│                    ClickHouse Writer                                │
+│                    (clickhouse_writer.py)                           │
+├─────────────────────────────────────────────────────────────────────┤
+│  - Read from multiple streams                                       │
+│  - Buffer messages (5000 rows or 30s)                              │
+│  - Batch insert to ClickHouse                                       │
+│  - Acknowledge messages                                             │
+└──────────────┬──────────────────────────────────────────────────────┘
+               │
+               │ batch_insert()
+               │
+┌──────────────▼──────────────────────────────────────────────────────┐
+│                         CLICKHOUSE                                   │
+├──────────────────────────────┬──────────────────────────────────────┤
+│  polymarket.markets          │  polymarket.order_filled             │
+│  - ReplacingMergeTree        │  - MergeTree                         │
+│  - Deduplication by id       │  - Partitioned by month              │
+├──────────────────────────────┼──────────────────────────────────────┤
+│  polymarket.trades           │                                      │
+│  - MergeTree                 │                                      │
+│  - Partitioned by month      │                                      │
+└──────────────────────────────┴──────────────────────────────────────┘
+
+
+MONITORING & OBSERVABILITY
+===========================
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Monitoring Dashboard                             │
+│                    (dashboard.py)                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│  FastAPI Web UI (http://localhost:8000)                            │
+│  - Stream lengths (pending messages)                               │
+│  - Ingester state (offsets/watermarks)                             │
+│  - ClickHouse table counts                                          │
+│  - Health checks                                                    │
+│  - Auto-refresh (5s)                                                │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                          LOGGING                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  Each component logs to:                                            │
+│  - Console (stdout) - for real-time monitoring                      │
+│  - File (logs/*.log) - for historical analysis                      │
+│                                                                      │
+│  Log format: timestamp - component - level - message                │
+└─────────────────────────────────────────────────────────────────────┘
+
+
+DATA FLOW
+=========
+
+1. API → Ingester → Redis Stream
+   - Ingesters poll APIs continuously
+   - Transform to standard format
+   - Push to Redis Streams
+   - Update state (cursor/watermark)
+
+2. Redis Stream → Processor → Redis Stream
+   - Trade processor reads order events
+   - Enriches with market data
+   - Calculates derived fields
+   - Pushes processed trades
+
+3. Redis Stream → Writer → ClickHouse
+   - Writer reads from all streams
+   - Buffers for batching
+   - Inserts in bulk to ClickHouse
+   - Acknowledges messages
+
+4. State Management
+   - Redis stores watermarks/cursors
+   - Enables crash recovery
+   - Prevents duplicate processing
+
+
+KEY FEATURES
+============
+
+✓ Real-time: <30 second end-to-end latency
+✓ Fault-tolerant: Auto-restart, state persistence
+✓ Scalable: Redis Streams + consumer groups
+✓ Observable: Web dashboard + structured logs
+✓ Modular: Each component independent
+✓ Exactly-once: Consumer groups + acknowledgments
+✓ Batching: Optimized ClickHouse writes
+
+
+DEPLOYMENT OPTIONS
+==================
+
+1. Docker Compose (Recommended)
+   - All services containerized
+   - Redis + ClickHouse included
+   - One-command startup
+   - Easy rollout/rollback
+
+2. Supervisor
+   - Process management
+   - Auto-restart on failure
+   - Log rotation
+   - Status monitoring
+
+3. Individual Processes
+   - Manual control
+   - Good for development
+   - Easy debugging
+
+
+CONFIGURATION
+=============
+
+Environment Variables:
+- REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
+- CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_DATABASE
+- CLICKHOUSE_USER, CLICKHOUSE_PASSWORD
+
+Code Configuration (common/config.py):
+- Batch sizes
+- Poll intervals
+- Stream names
+- Consumer groups
+- Timeout settings
+
+
+PERFORMANCE CHARACTERISTICS
+============================
+
+Expected Throughput (single machine):
+- Markets: 500-1000/min
+- Order Events: 5k-10k/min
+- Trades: 3k-8k/min
+
+Resource Usage:
+- CPU: 10-30% (5 processes)
+- RAM: 500MB-2GB
+- Redis: 100-500MB
+- Network: Minimal
+
+Latency:
+- API → Redis: <1s
+- Redis → ClickHouse: <30s
+- End-to-end: 10-60s
+
+
+SCALING CONSIDERATIONS
+======================
+
+Horizontal Scaling:
+- Run multiple processor instances
+- Redis consumer groups distribute load
+- Scale writer for higher throughput
+
+Vertical Scaling:
+- Increase batch sizes
+- Add more RAM for buffering
+- Use Redis Cluster for HA
+
+Production Enhancements:
+- Add Prometheus metrics
+- Implement circuit breakers
+- Set up alerting
+- Deploy to Kubernetes
+
+
+FILE STRUCTURE
+==============
+
+pipeline/
+├── common/              # Shared utilities
+│   ├── config.py        # Configuration
+│   ├── logging_config.py # Logging setup
+│   └── redis_queue.py   # Redis abstraction
+│
+├── ingesters/           # Data ingesters
+│   ├── polymarket_ingester.py
+│   └── goldsky_ingester.py
+│
+├── processors/          # Data processors
+│   ├── trade_processor.py
+│   └── clickhouse_writer.py
+│
+├── monitoring/          # Monitoring tools
+│   └── dashboard.py
+│
+├── logs/                # Log files
+│
+├── docker-compose.yml   # Docker deployment
+├── supervisord.conf     # Supervisor config
+├── requirements.txt     # Python dependencies
+├── setup_schema.py      # ClickHouse schema
+├── test_setup.py        # Setup verification
+├── start.sh             # Startup script
+└── stop.sh              # Shutdown script
+
+
+DESIGN PATTERNS
+===============
+
+1. Producer-Consumer Pattern
+   - Ingesters = Producers
+   - Processors/Writers = Consumers
+   - Redis Streams = Queue
+
+2. Stream Processing
+   - Continuous data flow
+   - Stateful processing
+   - Windowing/batching
+
+3. Microservices
+   - Independent components
+   - Single responsibility
+   - Loose coupling
+
+4. Event-Driven Architecture
+   - Events in Redis Streams
+   - Async processing
+   - Scalable by design
+"""
