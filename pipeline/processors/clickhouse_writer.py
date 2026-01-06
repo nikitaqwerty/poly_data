@@ -196,9 +196,13 @@ def write_events_batch(client, events: List[Dict]) -> int:
 
         data = []
         for idx, event in enumerate(events):
-            # Parse tags from semicolon-separated string
-            tags_str = event.get("tags", "")
-            tags_list = tags_str.split(";") if tags_str else []
+            # Parse tags - tolerate incoming list or semicolon-separated string
+            tags_raw = event.get("tags", "")
+            if isinstance(tags_raw, list):
+                tags_list = [t for t in tags_raw if t is not None]
+            else:
+                tags_str = str(tags_raw) if tags_raw is not None else ""
+                tags_list = tags_str.split(";") if tags_str else []
 
             # Parse datetime strings
             created_at = None
@@ -243,6 +247,64 @@ def write_events_batch(client, events: List[Dict]) -> int:
                         e,
                     )
 
+            # Fallback for pipelines/table variants that do not allow NULL datetimes
+            if created_at is None:
+                logger.warning(
+                    "Event %d (id=%s) missing createdAt; using epoch fallback",
+                    idx,
+                    event.get("id"),
+                )
+                created_at = datetime.fromtimestamp(0, tz=timezone.utc)
+            if start_date is None:
+                logger.debug(
+                    "Event %d (id=%s) missing startDate; using epoch fallback",
+                    idx,
+                    event.get("id"),
+                )
+                start_date = datetime.fromtimestamp(0, tz=timezone.utc)
+            if end_date is None:
+                logger.debug(
+                    "Event %d (id=%s) missing endDate; using epoch fallback",
+                    idx,
+                    event.get("id"),
+                )
+                end_date = datetime.fromtimestamp(0, tz=timezone.utc)
+
+            # Normalize datetimes to a safe ClickHouse range to avoid packing errors
+            min_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            max_dt = datetime(2200, 1, 1, tzinfo=timezone.utc)
+            for name, dt_val in (
+                ("createdAt", created_at),
+                ("startDate", start_date),
+                ("endDate", end_date),
+            ):
+                if dt_val.tzinfo is None:
+                    dt_val = dt_val.replace(tzinfo=timezone.utc)
+                if dt_val < min_dt:
+                    logger.warning(
+                        "Event %d (id=%s) %s below %s; clamping",
+                        idx,
+                        event.get("id"),
+                        name,
+                        min_dt,
+                    )
+                    dt_val = min_dt
+                if dt_val > max_dt:
+                    logger.warning(
+                        "Event %d (id=%s) %s above %s; clamping",
+                        idx,
+                        event.get("id"),
+                        name,
+                        max_dt,
+                    )
+                    dt_val = max_dt
+                if name == "createdAt":
+                    created_at = dt_val
+                elif name == "startDate":
+                    start_date = dt_val
+                else:
+                    end_date = dt_val
+
             # Handle numeric fields - convert to proper types, handling empty strings
             markets_count_value = event.get("markets_count", 0)
             try:
@@ -282,31 +344,6 @@ def write_events_batch(client, events: List[Dict]) -> int:
                     e,
                 )
                 liquidity = 0.0
-
-            # Use epoch as default for None datetime values to avoid insertion errors
-            # ClickHouse's clickhouse-connect library has issues with None in datetime columns
-            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-            if created_at is None:
-                logger.debug(
-                    "Event %d (id=%s) has None createdAt, using epoch default",
-                    idx,
-                    event.get("id"),
-                )
-                created_at = epoch
-            if start_date is None:
-                logger.debug(
-                    "Event %d (id=%s) has None startDate, using epoch default",
-                    idx,
-                    event.get("id"),
-                )
-                start_date = epoch
-            if end_date is None:
-                logger.debug(
-                    "Event %d (id=%s) has None endDate, using epoch default",
-                    idx,
-                    event.get("id"),
-                )
-                end_date = epoch
 
             row = (
                 str(event.get("id", "")),
@@ -349,27 +386,37 @@ def write_events_batch(client, events: List[Dict]) -> int:
                     row[14],
                 )
 
-            # Check for None values in non-nullable fields
-            if None in [
-                row[0],
-                row[1],
-                row[2],
-                row[3],
-                row[4],
-                row[9],
-                row[10],
-                row[11],
-                row[12],
-                row[13],
-                row[14],
-            ]:
+            # Check for None values in non-nullable fields (datetimes already normalized)
+            null_fields = [
+                name
+                for name, value in [
+                    ("id", row[0]),
+                    ("slug", row[1]),
+                    ("ticker", row[2]),
+                    ("title", row[3]),
+                    ("description", row[4]),
+                    ("tags", row[8]),
+                    ("markets_count", row[9]),
+                    ("active", row[10]),
+                    ("closed", row[11]),
+                    ("archived", row[12]),
+                    ("volume", row[13]),
+                    ("liquidity", row[14]),
+                ]
+                if value is None
+            ]
+            if any(t is None for t in row[8]):
+                null_fields.append("tags_item")
+
+            if null_fields:
                 logger.error(
-                    "Event %d has None in non-nullable field! Full event data: %s",
+                    "Event %d has None in fields %s! Full event data: %s",
                     idx,
+                    null_fields,
                     event,
                 )
                 logger.error("Event %d row values: %s", idx, row)
-                raise ValueError(f"Event {idx} contains None in non-nullable field")
+                raise ValueError(f"Event {idx} contains None in fields {null_fields}")
 
             data.append(row)
 
@@ -781,10 +828,10 @@ def run_writer():
                 logger.info("=" * 60)
                 last_flush_time = time.time()
 
-            # Periodic stream trimming (every 5 minutes)
+            # Periodic stream trimming (every 1 minute to prevent unbounded growth)
             # Only trim streams that are safe (data already written to ClickHouse)
             time_since_trim = current_time - last_trim_time
-            if time_since_trim >= 300:  # 5 minutes
+            if time_since_trim >= 60:  # 1 minute (more frequent to prevent buildup)
                 logger.info("Checking streams for safe trimming...")
 
                 # For TRADES stream, check pending count before trimming
@@ -793,39 +840,65 @@ def run_writer():
                 )
                 trades_total = queue.get_stream_length(redis_config.TRADES_STREAM)
 
-                # Only trim if we have acknowledged messages (total - pending > 50k)
-                if trades_total - trades_pending_count > 50000:
+                # Trim to a smaller size (20k) to prevent unbounded growth
+                MAX_TRADES_LENGTH = 20000
+
+                # Only trim if we have acknowledged messages (total - pending > threshold)
+                if trades_total - trades_pending_count > MAX_TRADES_LENGTH:
                     logger.info(
                         "TRADES: %d total, %d pending. Trimming acknowledged messages...",
                         trades_total,
                         trades_pending_count,
                     )
-                    queue.trim_stream(redis_config.TRADES_STREAM, max_length=50000)
-                else:
+                    queue.trim_stream(
+                        redis_config.TRADES_STREAM, max_length=MAX_TRADES_LENGTH
+                    )
+                    after_trim = queue.get_stream_length(redis_config.TRADES_STREAM)
                     logger.info(
-                        "TRADES: %d total, %d pending. Not trimming (would lose data)",
+                        "✓ Trimmed TRADES from %d to %d messages",
+                        trades_total,
+                        after_trim,
+                    )
+                else:
+                    logger.debug(
+                        "TRADES: %d total, %d pending. Not trimming yet (threshold: %d)",
                         trades_total,
                         trades_pending_count,
+                        MAX_TRADES_LENGTH,
                     )
 
                 # For MARKETS and EVENTS, we track our position with last_id
                 # These can be trimmed safely since we've read them
+                MAX_MARKETS_LENGTH = 20000
                 markets_len = queue.get_stream_length(redis_config.MARKETS_STREAM)
-                if (
-                    markets_len > 100000
-                ):  # Higher threshold since we're tracking position
-                    logger.info("Trimming MARKETS stream (%d messages)...", markets_len)
-                    queue.trim_stream(redis_config.MARKETS_STREAM, max_length=50000)
+                if markets_len > MAX_MARKETS_LENGTH:
+                    logger.info(
+                        "Trimming MARKETS stream from %d messages...", markets_len
+                    )
+                    queue.trim_stream(
+                        redis_config.MARKETS_STREAM, max_length=MAX_MARKETS_LENGTH
+                    )
+                    after_trim = queue.get_stream_length(redis_config.MARKETS_STREAM)
+                    logger.info("✓ Trimmed MARKETS to %d messages", after_trim)
 
+                MAX_EVENTS_LENGTH = 20000
                 events_len = queue.get_stream_length(
                     redis_config.POLYMARKET_EVENTS_STREAM
                 )
-                if events_len > 100000:
+                if events_len > MAX_EVENTS_LENGTH:
                     logger.info(
-                        "Trimming POLYMARKET_EVENTS stream (%d messages)...", events_len
+                        "Trimming POLYMARKET_EVENTS stream from %d messages...",
+                        events_len,
                     )
                     queue.trim_stream(
-                        redis_config.POLYMARKET_EVENTS_STREAM, max_length=50000
+                        redis_config.POLYMARKET_EVENTS_STREAM,
+                        max_length=MAX_EVENTS_LENGTH,
+                    )
+                    after_trim = queue.get_stream_length(
+                        redis_config.POLYMARKET_EVENTS_STREAM
+                    )
+                    logger.info(
+                        "✓ Trimmed POLYMARKET_EVENTS to %d messages", after_trim
                     )
 
                 logger.info("✓ Safe trimming complete")

@@ -2,6 +2,7 @@
 
 import json
 import redis
+import time
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -19,8 +20,14 @@ class RedisQueue:
     Provides state management for cursors/watermarks.
     """
 
-    def __init__(self):
-        """Initialize Redis connection"""
+    def __init__(self, max_retries: int = 30, retry_delay: float = 2.0):
+        """
+        Initialize Redis connection with retry logic
+
+        Args:
+            max_retries: Maximum number of connection attempts
+            retry_delay: Initial delay between retries (uses exponential backoff)
+        """
         self.client = redis.Redis(
             host=redis_config.host,
             port=redis_config.port,
@@ -29,18 +36,76 @@ class RedisQueue:
             decode_responses=True,
             socket_keepalive=True,
             socket_connect_timeout=5,
-            socket_timeout=5,
+            socket_timeout=30,  # Must be longer than block times (typically 5-10s)
         )
 
-        # Test connection
-        try:
-            self.client.ping()
-            logger.info(
-                "✓ Connected to Redis at %s:%d", redis_config.host, redis_config.port
-            )
-        except redis.ConnectionError as e:
-            logger.error("✗ Failed to connect to Redis: %s", e)
-            raise
+        # Test connection with retry logic for Redis loading scenarios
+        self._wait_for_redis_ready(max_retries, retry_delay)
+
+    def _wait_for_redis_ready(self, max_retries: int, initial_delay: float):
+        """
+        Wait for Redis to be ready, handling loading and connection errors
+
+        Args:
+            max_retries: Maximum number of connection attempts
+            initial_delay: Initial delay between retries
+        """
+        delay = initial_delay
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.client.ping()
+                logger.info(
+                    "✓ Connected to Redis at %s:%d",
+                    redis_config.host,
+                    redis_config.port,
+                )
+                return
+            except redis.BusyLoadingError:
+                # Redis is loading data from disk
+                if attempt == 1:
+                    logger.warning(
+                        "Redis is loading dataset into memory. Waiting for it to be ready..."
+                    )
+                logger.info(
+                    "Attempt %d/%d: Redis still loading, retrying in %.1fs...",
+                    attempt,
+                    max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                delay = min(delay * 1.5, 30)  # Exponential backoff, max 30s
+            except (redis.ConnectionError, ConnectionRefusedError) as e:
+                # Connection refused or network error
+                if attempt == 1:
+                    logger.warning(
+                        "Cannot connect to Redis at %s:%d. Retrying...",
+                        redis_config.host,
+                        redis_config.port,
+                    )
+                logger.info(
+                    "Attempt %d/%d: Connection failed (%s), retrying in %.1fs...",
+                    attempt,
+                    max_retries,
+                    str(e)[:50],
+                    delay,
+                )
+                time.sleep(delay)
+                delay = min(delay * 1.5, 30)  # Exponential backoff, max 30s
+            except Exception as e:
+                # Unexpected error
+                logger.error("✗ Unexpected error connecting to Redis: %s", e)
+                raise
+
+        # Max retries exceeded
+        logger.error(
+            "✗ Failed to connect to Redis after %d attempts. "
+            "Redis may be down or still loading.",
+            max_retries,
+        )
+        raise redis.ConnectionError(
+            f"Failed to connect to Redis at {redis_config.host}:{redis_config.port} "
+            f"after {max_retries} attempts"
+        )
 
     def push_to_stream(self, stream_name: str, data: Dict[str, Any]) -> str:
         """
@@ -62,6 +127,16 @@ class RedisQueue:
 
             message_id = self.client.xadd(stream_name, serialized_data)
             return message_id
+        except redis.ResponseError as e:
+            if "MISCONF" in str(e):
+                logger.error(
+                    "Redis persistence error (MISCONF). Redis cannot save to disk. "
+                    "Check Redis logs and disk space: %s",
+                    e,
+                )
+            else:
+                logger.error("Error pushing to stream %s: %s", stream_name, e)
+            raise
         except Exception as e:
             logger.error("Error pushing to stream %s: %s", stream_name, e)
             raise
@@ -91,6 +166,16 @@ class RedisQueue:
 
             pipe.execute()
             return len(data_list)
+        except redis.ResponseError as e:
+            if "MISCONF" in str(e):
+                logger.error(
+                    "Redis persistence error (MISCONF). Redis cannot save to disk. "
+                    "Check Redis logs and disk space. Batch of %d messages failed.",
+                    len(data_list),
+                )
+            else:
+                logger.error("Error pushing batch to stream %s: %s", stream_name, e)
+            raise
         except Exception as e:
             logger.error("Error pushing batch to stream %s: %s", stream_name, e)
             raise
@@ -116,32 +201,50 @@ class RedisQueue:
         Returns:
             List of (message_id, data_dict) tuples
         """
-        try:
-            # Ensure consumer group exists
-            self._ensure_consumer_group(stream_name, consumer_group)
+        max_retries = 3
+        retry_delay = 1.0
 
-            # Read from stream
-            messages = self.client.xreadgroup(
-                groupname=consumer_group,
-                consumername=consumer_name,
-                streams={stream_name: ">"},
-                count=count,
-                block=block,
-                noack=False,
-            )
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Ensure consumer group exists
+                self._ensure_consumer_group(stream_name, consumer_group)
 
-            result = []
-            if messages:
-                for stream, message_list in messages:
-                    for message_id, message_data in message_list:
-                        # Deserialize JSON data
-                        data = json.loads(message_data["data"])
-                        result.append((message_id, data))
+                # Read from stream
+                messages = self.client.xreadgroup(
+                    groupname=consumer_group,
+                    consumername=consumer_name,
+                    streams={stream_name: ">"},
+                    count=count,
+                    block=block,
+                    noack=False,
+                )
 
-            return result
-        except Exception as e:
-            logger.error("Error reading from stream %s: %s", stream_name, e)
-            raise
+                result = []
+                if messages:
+                    for stream, message_list in messages:
+                        for message_id, message_data in message_list:
+                            # Deserialize JSON data
+                            data = json.loads(message_data["data"])
+                            result.append((message_id, data))
+
+                return result
+            except redis.BusyLoadingError:
+                if attempt < max_retries:
+                    logger.warning(
+                        "Redis loading while reading from %s, retry %d/%d in %.1fs",
+                        stream_name,
+                        attempt,
+                        max_retries,
+                        retry_delay,
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logger.error("Redis still loading after %d retries", max_retries)
+                    raise
+            except Exception as e:
+                logger.error("Error reading from stream %s: %s", stream_name, e)
+                raise
 
     def read_from_stream_simple(
         self, stream_name: str, last_id: str = "0", count: int = 100, block: int = 5000
@@ -158,22 +261,40 @@ class RedisQueue:
         Returns:
             List of (message_id, data_dict) tuples
         """
-        try:
-            messages = self.client.xread(
-                streams={stream_name: last_id}, count=count, block=block
-            )
+        max_retries = 3
+        retry_delay = 1.0
 
-            result = []
-            if messages:
-                for stream, message_list in messages:
-                    for message_id, message_data in message_list:
-                        data = json.loads(message_data["data"])
-                        result.append((message_id, data))
+        for attempt in range(1, max_retries + 1):
+            try:
+                messages = self.client.xread(
+                    streams={stream_name: last_id}, count=count, block=block
+                )
 
-            return result
-        except Exception as e:
-            logger.error("Error reading from stream %s: %s", stream_name, e)
-            raise
+                result = []
+                if messages:
+                    for stream, message_list in messages:
+                        for message_id, message_data in message_list:
+                            data = json.loads(message_data["data"])
+                            result.append((message_id, data))
+
+                return result
+            except redis.BusyLoadingError:
+                if attempt < max_retries:
+                    logger.warning(
+                        "Redis loading while reading from %s, retry %d/%d in %.1fs",
+                        stream_name,
+                        attempt,
+                        max_retries,
+                        retry_delay,
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logger.error("Redis still loading after %d retries", max_retries)
+                    raise
+            except Exception as e:
+                logger.error("Error reading from stream %s: %s", stream_name, e)
+                raise
 
     def ack_message(self, stream_name: str, consumer_group: str, message_id: str):
         """
@@ -319,9 +440,114 @@ class RedisQueue:
             max_length: Maximum number of messages to keep
         """
         try:
-            self.client.xtrim(stream_name, maxlen=max_length, approximate=True)
+            # Use approximate=False for exact trimming to prevent unbounded growth
+            # This is more CPU-intensive but ensures messages are actually removed
+            self.client.xtrim(stream_name, maxlen=max_length, approximate=False)
+            logger.debug("Trimmed stream %s to max length %d", stream_name, max_length)
         except Exception as e:
             logger.error("Error trimming stream: %s", e)
+
+    def delete_old_messages(
+        self, stream_name: str, consumer_group: str, min_idle_time: int = 3600000
+    ):
+        """
+        Delete old acknowledged messages from a stream.
+
+        This method:
+        1. Finds all pending messages that have been idle for too long
+        2. Checks which messages have been acknowledged
+        3. Deletes acknowledged messages to free up memory
+
+        Note: Redis Streams keeps messages even after acknowledgment.
+        This method helps clean up the stream to prevent unbounded growth.
+
+        Args:
+            stream_name: Name of the stream
+            consumer_group: Consumer group name
+            min_idle_time: Minimum idle time in milliseconds before considering deletion
+        """
+        try:
+            # Get stream info to find the first and last message IDs
+            try:
+                stream_info = self.client.xinfo_stream(stream_name)
+                if not stream_info or stream_info.get("length", 0) == 0:
+                    logger.debug("Stream %s is empty, nothing to clean", stream_name)
+                    return
+
+                first_entry = stream_info.get("first-entry")
+                if not first_entry:
+                    return
+
+                first_id = first_entry[0]
+
+                # Parse the timestamp from the message ID (format: timestamp-sequence)
+                first_timestamp = int(first_id.split("-")[0])
+                current_timestamp = int(datetime.utcnow().timestamp() * 1000)
+
+                # Calculate the minimum ID to keep (messages older than min_idle_time)
+                min_timestamp_to_delete = current_timestamp - min_idle_time
+
+                # Only proceed if the oldest message is old enough
+                if first_timestamp >= min_timestamp_to_delete:
+                    logger.debug(
+                        "No messages old enough to delete in %s (oldest: %d ms ago)",
+                        stream_name,
+                        current_timestamp - first_timestamp,
+                    )
+                    return
+
+                # Construct the minimum ID to keep (all messages before this will be deleted)
+                min_id_to_keep = f"{min_timestamp_to_delete}-0"
+
+                # Use XTRIM with MINID to remove old messages
+                # This is more efficient than deleting individual messages
+                deleted_count = self.client.xtrim(
+                    stream_name, minid=min_id_to_keep, approximate=False
+                )
+
+                if deleted_count > 0:
+                    logger.info(
+                        "✓ Deleted %d old messages from stream %s (older than %d ms)",
+                        deleted_count,
+                        stream_name,
+                        min_idle_time,
+                    )
+                else:
+                    logger.debug("No messages deleted from stream %s", stream_name)
+
+            except redis.ResponseError as e:
+                # Consumer group might not exist yet, which is fine
+                if "no such key" in str(e).lower():
+                    logger.debug("Stream %s does not exist yet", stream_name)
+                else:
+                    logger.error("Error getting stream info for %s: %s", stream_name, e)
+
+        except Exception as e:
+            logger.error(
+                "Error deleting old messages from stream %s: %s", stream_name, e
+            )
+
+    def cleanup_stream(
+        self, stream_name: str, consumer_group: str, max_length: int, min_idle_time: int
+    ):
+        """
+        Comprehensive stream cleanup: trim by length and delete old messages
+
+        Args:
+            stream_name: Name of the stream
+            consumer_group: Consumer group name
+            max_length: Maximum number of messages to keep
+            min_idle_time: Minimum idle time in milliseconds before deletion
+        """
+        try:
+            # First, delete old acknowledged messages
+            self.delete_old_messages(stream_name, consumer_group, min_idle_time)
+
+            # Then, trim to maximum length as a safety net
+            self.trim_stream(stream_name, max_length)
+
+        except Exception as e:
+            logger.error("Error during stream cleanup for %s: %s", stream_name, e)
 
     # State management methods
 

@@ -100,6 +100,9 @@ def run_ingester():
         ).strftime("%Y-%m-%d %H:%M:%S UTC")
         logger.info("Resuming from timestamp %d (%s)", last_timestamp, readable_time)
 
+    # Track last cleanup time
+    last_cleanup_time = time.time()
+
     try:
         while True:
             logger.info("Fetching order events after timestamp %d...", last_timestamp)
@@ -160,6 +163,18 @@ def run_ingester():
             else:
                 # Small delay between batches
                 time.sleep(1)
+
+            # Periodic stream cleanup
+            current_time = time.time()
+            if current_time - last_cleanup_time >= redis_config.STREAM_CLEANUP_INTERVAL:
+                logger.info("Running periodic stream cleanup...")
+                queue.cleanup_stream(
+                    redis_config.EVENTS_STREAM,
+                    redis_config.EVENTS_GROUP,
+                    redis_config.STREAM_MAX_LENGTH,
+                    redis_config.STREAM_MIN_IDLE_TIME,
+                )
+                last_cleanup_time = current_time
 
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down...")

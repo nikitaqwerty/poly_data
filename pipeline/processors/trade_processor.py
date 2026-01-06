@@ -175,14 +175,18 @@ def run_processor():
 
     # Check EVENTS_STREAM status but don't trim automatically
     events_length = queue.get_stream_length(redis_config.EVENTS_STREAM)
-    events_pending = queue.get_pending_count(redis_config.EVENTS_STREAM, redis_config.EVENTS_GROUP)
-    
-    logger.info("EVENTS_STREAM: %d messages (%d pending)", events_length, events_pending)
-    
+    events_pending = queue.get_pending_count(
+        redis_config.EVENTS_STREAM, redis_config.EVENTS_GROUP
+    )
+
+    logger.info(
+        "EVENTS_STREAM: %d messages (%d pending)", events_length, events_pending
+    )
+
     if events_pending > 100000:
         logger.warning(
             "⚠️  Large backlog of %d pending order events! May take time to process.",
-            events_pending
+            events_pending,
         )
 
     try:
@@ -234,30 +238,44 @@ def run_processor():
 
             batch_count += 1
 
-            # Periodic stream trimming to prevent unbounded growth (every 5 minutes)
+            # Periodic stream trimming to prevent unbounded growth (every 1 minute)
             # Only trim acknowledged messages to avoid data loss
             current_time = time.time()
             time_since_trim = current_time - last_trim_time
-            if time_since_trim >= 300:  # 5 minutes
+            if time_since_trim >= 60:  # 1 minute (more frequent to prevent buildup)
                 events_total = queue.get_stream_length(redis_config.EVENTS_STREAM)
                 events_pending_count = queue.get_pending_count(
                     redis_config.EVENTS_STREAM, redis_config.EVENTS_GROUP
                 )
-                
+
+                # Trim to a smaller size (20k) to prevent unbounded growth
+                # Even with high throughput, 20k messages is plenty of buffer
+                MAX_STREAM_LENGTH = 20000
+
                 # Only trim if we have lots of acknowledged messages
-                if events_total - events_pending_count > 50000:
+                if events_total - events_pending_count > MAX_STREAM_LENGTH:
                     logger.info(
                         "EVENTS_STREAM: %d total, %d pending. Trimming acknowledged messages...",
-                        events_total, events_pending_count
+                        events_total,
+                        events_pending_count,
                     )
-                    queue.trim_stream(redis_config.EVENTS_STREAM, max_length=50000)
-                    logger.info("✓ Trimmed EVENTS_STREAM")
+                    queue.trim_stream(
+                        redis_config.EVENTS_STREAM, max_length=MAX_STREAM_LENGTH
+                    )
+                    after_trim = queue.get_stream_length(redis_config.EVENTS_STREAM)
+                    logger.info(
+                        "✓ Trimmed EVENTS_STREAM from %d to %d messages",
+                        events_total,
+                        after_trim,
+                    )
                 else:
                     logger.debug(
-                        "EVENTS_STREAM: %d total, %d pending. Not trimming (would lose data)",
-                        events_total, events_pending_count
+                        "EVENTS_STREAM: %d total, %d pending. Not trimming yet (threshold: %d)",
+                        events_total,
+                        events_pending_count,
+                        MAX_STREAM_LENGTH,
                     )
-                
+
                 last_trim_time = current_time
 
     except KeyboardInterrupt:

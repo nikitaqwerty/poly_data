@@ -35,6 +35,14 @@ class RedisConfig:
     # State keys
     STATE_PREFIX = "state:"
 
+    # Stream retention settings
+    # Maximum number of messages to keep in a stream (approximate)
+    STREAM_MAX_LENGTH = 100000
+    # Minimum time (in milliseconds) to keep messages before trimming
+    STREAM_MIN_IDLE_TIME = 3600000  # 1 hour
+    # How often to run stream cleanup (in seconds)
+    STREAM_CLEANUP_INTERVAL = 300  # 5 minutes
+
 
 @dataclass
 class ClickHouseConfig:
@@ -58,9 +66,9 @@ class APIConfig:
     )
 
     # Rate limiting and batch sizes
-    polymarket_batch_size: int = 500
+    polymarket_batch_size: int = 500  # max is 500
     polymarket_poll_interval: int = 30  # seconds
-    goldsky_batch_size: int = 1000
+    goldsky_batch_size: int = 1000  # max is 1000
     goldsky_poll_interval: int = 5  # seconds
     request_timeout: int = 30  # seconds
 
@@ -69,8 +77,9 @@ class APIConfig:
 class ProcessingConfig:
     """Processing configuration"""
 
-    trade_processor_batch_size: int = 1000
-    trade_processor_interval: int = 5  # seconds
+    # Trade processor config - increased to match high throughput needs
+    trade_processor_batch_size: int = 50000  # Process 50k order events at a time
+    trade_processor_interval: int = 1  # Check more frequently (was 5 seconds)
 
     # ClickHouse writer config - optimized for high throughput
     # Read more messages per call to fill buffer faster
