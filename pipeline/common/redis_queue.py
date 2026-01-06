@@ -608,6 +608,115 @@ class RedisQueue:
         except Exception as e:
             logger.error("Error deleting state for key %s: %s", key, e)
 
+    # Retry tracking methods
+
+    def get_retry_count(self, stream_name: str, message_id: str) -> int:
+        """
+        Get the retry count for a message
+
+        Args:
+            stream_name: Name of the stream
+            message_id: Message ID
+
+        Returns:
+            Current retry count (0 if never retried)
+        """
+        try:
+            retry_key = f"retry:{stream_name}:{message_id}"
+            count = self.client.get(retry_key)
+            return int(count) if count else 0
+        except Exception as e:
+            logger.error("Error getting retry count for message %s: %s", message_id, e)
+            return 0
+
+    def increment_retry_count(
+        self, stream_name: str, message_id: str, ttl_seconds: int = 86400
+    ) -> int:
+        """
+        Increment the retry count for a message
+
+        Args:
+            stream_name: Name of the stream
+            message_id: Message ID
+            ttl_seconds: Time to live for the retry counter (default 24 hours)
+
+        Returns:
+            New retry count
+        """
+        try:
+            retry_key = f"retry:{stream_name}:{message_id}"
+            count = self.client.incr(retry_key)
+            # Set expiry to avoid memory leaks (message IDs are unique)
+            self.client.expire(retry_key, ttl_seconds)
+            return count
+        except Exception as e:
+            logger.error(
+                "Error incrementing retry count for message %s: %s", message_id, e
+            )
+            return 0
+
+    def delete_retry_count(self, stream_name: str, message_id: str):
+        """
+        Delete the retry counter for a message
+
+        Args:
+            stream_name: Name of the stream
+            message_id: Message ID
+        """
+        try:
+            retry_key = f"retry:{stream_name}:{message_id}"
+            self.client.delete(retry_key)
+        except Exception as e:
+            logger.error("Error deleting retry count for message %s: %s", message_id, e)
+
+    def move_to_dlq(
+        self,
+        dlq_stream: str,
+        original_stream: str,
+        message_id: str,
+        message_data: Dict[str, Any],
+        failure_reason: str,
+        retry_count: int,
+    ):
+        """
+        Move a failed message to the dead letter queue (DLQ)
+
+        Args:
+            dlq_stream: Name of the DLQ stream
+            original_stream: Name of the original stream
+            message_id: Original message ID
+            message_data: Original message data
+            failure_reason: Reason for failure
+            retry_count: Number of times the message was retried
+        """
+        try:
+            # Add metadata to the message
+            dlq_data = {
+                "original_stream": original_stream,
+                "original_message_id": message_id,
+                "retry_count": retry_count,
+                "failure_reason": failure_reason,
+                "failed_at": datetime.utcnow().isoformat(),
+                "original_data": message_data,
+            }
+
+            # Push to DLQ stream
+            self.push_to_stream(dlq_stream, dlq_data)
+            logger.warning(
+                "⚠️  Moved message %s to DLQ after %d retries. Reason: %s",
+                message_id,
+                retry_count,
+                failure_reason,
+            )
+        except Exception as e:
+            logger.error(
+                "❌ CRITICAL: Failed to move message %s to DLQ: %s. DATA MAY BE LOST!",
+                message_id,
+                e,
+                exc_info=True,
+            )
+            raise
+
     def close(self):
         """Close Redis connection"""
         try:

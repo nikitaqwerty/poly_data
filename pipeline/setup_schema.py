@@ -63,7 +63,7 @@ def create_markets_table():
         closedTime Nullable(DateTime),
         modifiedDateTime DateTime DEFAULT now()
     ) ENGINE = ReplacingMergeTree(modifiedDateTime)
-    ORDER BY (id, createdAt)
+    ORDER BY (createdAt, id, market_slug)
     """
 
     client.command(schema)
@@ -101,7 +101,7 @@ def create_polymarket_events_table():
         liquidity Float64,
         modifiedDateTime DateTime DEFAULT now()
     ) ENGINE = ReplacingMergeTree(modifiedDateTime)
-    ORDER BY (slug, id)
+    ORDER BY (id, slug, title)
     """
 
     client.command(schema)
@@ -136,7 +136,7 @@ def create_trades_table():
         modifiedDateTime DateTime DEFAULT now()
     ) ENGINE = ReplacingMergeTree(modifiedDateTime)
     PARTITION BY toYYYYMM(timestamp)
-    ORDER BY (timestamp, market_id, transactionHash)
+    ORDER BY (timestamp, transactionHash, maker, taker, price, usd_amount, token_amount)
     """
 
     client.command(schema)

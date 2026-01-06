@@ -25,6 +25,7 @@ class RedisConfig:
     POLYMARKET_EVENTS_STREAM = "stream:polymarket_events"
     EVENTS_STREAM = "stream:order_events"
     TRADES_STREAM = "stream:trades"
+    EVENTS_DLQ_STREAM = "stream:order_events_dlq"  # Dead letter queue for failed events
 
     # Consumer groups
     MARKETS_GROUP = "markets_writers"
@@ -86,6 +87,15 @@ class ProcessingConfig:
     clickhouse_writer_batch_size: int = 50000  # ClickHouse handles large batches well
     clickhouse_writer_interval: int = 10  # seconds
     clickhouse_writer_max_wait: int = 10  # Flush more frequently to reduce latency
+
+    # Retry configuration for failed messages
+    max_retry_attempts: int = 5  # Maximum number of retry attempts before moving to DLQ
+    retry_base_delay: int = (
+        60  # Base delay in seconds (exponential backoff: 1min, 2min, 4min, 8min, 16min)
+    )
+    retry_claim_interval: int = (
+        30  # How often to check for messages that need retry (seconds)
+    )
 
 
 # Singleton instances
