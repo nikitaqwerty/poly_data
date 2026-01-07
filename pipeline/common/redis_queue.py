@@ -209,15 +209,27 @@ class RedisQueue:
                 # Ensure consumer group exists
                 self._ensure_consumer_group(stream_name, consumer_group)
 
-                # Read from stream
+                # First, try to read pending messages for this consumer (ID '0')
+                # These are messages that were delivered but not acknowledged (e.g., retries)
                 messages = self.client.xreadgroup(
                     groupname=consumer_group,
                     consumername=consumer_name,
-                    streams={stream_name: ">"},
+                    streams={stream_name: "0"},
                     count=count,
-                    block=block,
+                    block=0,  # Don't block for pending messages
                     noack=False,
                 )
+
+                # If no pending messages, read new messages (ID '>')
+                if not messages or not messages[0][1]:
+                    messages = self.client.xreadgroup(
+                        groupname=consumer_group,
+                        consumername=consumer_name,
+                        streams={stream_name: ">"},
+                        count=count,
+                        block=block,
+                        noack=False,
+                    )
 
                 result = []
                 if messages:
