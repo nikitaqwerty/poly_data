@@ -36,10 +36,11 @@ A production-ready, Redis-based real-time data pipeline for Polymarket data that
 - **polymarket_ingester.py**: Polls Polymarket API for markets data
 - **polymarket_events_ingester.py**: Polls Polymarket API for events data (including tags)
 - **goldsky_ingester.py**: Polls Goldsky GraphQL for order events
+- **address_checker_ingester.py**: Checks addresses from trades to determine if they're contracts or wallets
 
 ### Processors
 - **trade_processor.py**: Processes order events into trades
-- **clickhouse_writer.py**: Batch writes to ClickHouse (markets, events, trades)
+- **clickhouse_writer.py**: Batch writes to ClickHouse (markets, events, trades, address_metadata)
 
 ### Monitoring
 - **dashboard.py**: FastAPI web dashboard (http://localhost:8000)
@@ -112,6 +113,9 @@ Edit `common/config.py` or use environment variables:
 - `CLICKHOUSE_USER` (default: default)
 - `CLICKHOUSE_PASSWORD` (optional)
 - `CLICKHOUSE_DATABASE` (default: polymarket)
+
+### Address Checker Configuration
+- `POLYGON_RPC_URL` - **Required** for address checker ingester (e.g., https://polygon-rpc.com or Infura/Alchemy endpoint)
 
 ### Processing Configuration
 See `common/config.py` for batch sizes, intervals, etc.
@@ -262,18 +266,29 @@ python3 ingesters/polymarket_ingester.py
 
 ## 📊 ClickHouse Tables
 
-The pipeline creates and populates two main tables:
+The pipeline creates and populates these main tables:
 
 ### markets
 Stores market information from Polymarket API
 - ReplacingMergeTree engine (deduplication by id)
 - Contains: market details, tokens, conditions, volume, tags
 
+### polymarket_events
+Stores event information from Polymarket API
+- ReplacingMergeTree engine
+- Contains: event details, tags, markets count, volume, liquidity
+
 ### trades
 Stores processed trade data from order events
 - MergeTree engine
 - Partitioned by month (toYYYYMM)
 - Contains: timestamp, market_id, maker, taker, price, volumes, direction
+
+### address_metadata
+Stores metadata about addresses (makers/takers from trades)
+- ReplacingMergeTree engine (latest check wins)
+- Contains: address, address_type (contract/wallet), transaction_count, first_transaction_date, checked_at
+- Automatically populated by address_checker_ingester
 
 ## 🚦 Next Steps
 
@@ -293,6 +308,61 @@ Stores processed trade data from order events
 - Implement exactly-once with Redis transactions
 - Add data validation layer
 - Create dead-letter queue for failed messages
+
+## 🔍 Address Checker Feature
+
+The address checker ingester automatically identifies whether addresses in the trades table are smart contracts or externally owned accounts (wallets).
+
+### How It Works
+1. Pulls distinct maker and taker addresses from the `trades` table
+2. Checks addresses that haven't been processed yet (not in `address_metadata`)
+3. Queries Polygon RPC using `eth_getCode` to determine address type
+4. Queries `eth_getTransactionCount` to get total transactions
+5. Writes results to `address_metadata` table
+
+### Setup
+```bash
+# 1. Add Polygon RPC URL to .env
+echo "POLYGON_RPC_URL=https://polygon-rpc.com" >> .env
+# Or use a provider like Infura, Alchemy, or Goldsky:
+# echo "POLYGON_RPC_URL=https://polygon-mainnet.infura.io/v3/YOUR_KEY" >> .env
+
+# 2. Initialize the infrastructure
+python3 init_address_checker.py
+
+# 3. Create the table in ClickHouse
+python3 setup_schema.py
+
+# 4. Start the ingester (if using supervisord)
+supervisorctl start address_checker_ingester
+```
+
+### Query Examples
+```sql
+-- Get all contract addresses
+SELECT address, transaction_count, checked_at
+FROM polymarket.address_metadata
+WHERE address_type = 'contract'
+ORDER BY transaction_count DESC;
+
+-- Join with trades to see contract trading activity
+SELECT t.maker, t.taker, am.address_type, t.usd_amount
+FROM polymarket.trades t
+LEFT JOIN polymarket.address_metadata am ON t.maker = am.address
+WHERE am.address_type = 'contract'
+LIMIT 100;
+
+-- Count addresses by type
+SELECT address_type, COUNT(*) as count, SUM(transaction_count) as total_txs
+FROM polymarket.address_metadata
+GROUP BY address_type;
+```
+
+### Notes
+- The ingester processes addresses in batches (default 500 per batch)
+- Includes rate limiting to avoid overwhelming RPC endpoints
+- Uses ReplacingMergeTree so addresses can be re-checked (latest wins)
+- First transaction date is currently NULL (can be enhanced with blockchain indexer)
 
 ## 📝 Notes
 

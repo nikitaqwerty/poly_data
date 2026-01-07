@@ -25,6 +25,7 @@ class RedisConfig:
     POLYMARKET_EVENTS_STREAM = "stream:polymarket_events"
     EVENTS_STREAM = "stream:order_events"
     TRADES_STREAM = "stream:trades"
+    ADDRESS_METADATA_STREAM = "stream:address_metadata"
     EVENTS_DLQ_STREAM = "stream:order_events_dlq"  # Dead letter queue for failed events
 
     # Consumer groups
@@ -32,6 +33,7 @@ class RedisConfig:
     POLYMARKET_EVENTS_GROUP = "polymarket_events_writers"
     EVENTS_GROUP = "events_processors"
     TRADES_GROUP = "trades_writers"
+    ADDRESS_METADATA_GROUP = "address_metadata_writers"
 
     # State keys
     STATE_PREFIX = "state:"
@@ -71,6 +73,10 @@ class APIConfig:
     polymarket_poll_interval: int = 30  # seconds
     goldsky_batch_size: int = 1000  # max is 1000
     goldsky_poll_interval: int = 5  # seconds
+    address_checker_batch_size: int = 500  # addresses to check per batch
+    address_checker_poll_interval: int = (
+        60  # seconds (wait between checks when caught up)
+    )
     request_timeout: int = 30  # seconds
 
 

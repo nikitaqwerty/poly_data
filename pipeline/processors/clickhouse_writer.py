@@ -603,6 +603,125 @@ def write_trades_batch(client, trades: List[Dict]) -> int:
         raise
 
 
+def write_address_metadata_batch(client, address_metadata: List[Dict]) -> int:
+    """
+    Write address metadata to ClickHouse
+
+    Args:
+        client: ClickHouse client
+        address_metadata: List of address metadata dictionaries
+
+    Returns:
+        Number of records written
+    """
+    if not address_metadata:
+        return 0
+
+    try:
+        logger.info(
+            "Processing %d address metadata records for ClickHouse insertion...",
+            len(address_metadata),
+        )
+
+        data = []
+        for idx, metadata in enumerate(address_metadata):
+            # Parse checked_at timestamp
+            checked_at = None
+            if metadata.get("checked_at"):
+                try:
+                    checked_at = datetime.fromisoformat(
+                        metadata["checked_at"].replace("Z", "+00:00")
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Metadata %d: Failed to parse checked_at '%s': %s",
+                        idx,
+                        metadata.get("checked_at"),
+                        e,
+                    )
+                    # Fallback to current time
+                    checked_at = datetime.utcnow()
+            else:
+                checked_at = datetime.utcnow()
+
+            # Parse first_transaction_date (nullable)
+            first_tx_date = None
+            if metadata.get("first_transaction_date"):
+                try:
+                    first_tx_date = datetime.fromisoformat(
+                        metadata["first_transaction_date"].replace("Z", "+00:00")
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Metadata %d: Failed to parse first_transaction_date '%s': %s",
+                        idx,
+                        metadata.get("first_transaction_date"),
+                        e,
+                    )
+
+            # Handle transaction count
+            tx_count_value = metadata.get("transaction_count", 0)
+            try:
+                tx_count = (
+                    int(tx_count_value) if tx_count_value not in ("", None) else 0
+                )
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Metadata %d: Failed to parse transaction_count '%s': %s",
+                    idx,
+                    tx_count_value,
+                    e,
+                )
+                tx_count = 0
+
+            row = (
+                str(metadata.get("address", "")),
+                str(metadata.get("address_type", "unknown")),
+                tx_count,
+                first_tx_date,
+                checked_at,
+            )
+
+            # Check for required fields
+            if not row[0]:
+                logger.error(
+                    "Metadata %d has empty address! Full metadata: %s", idx, metadata
+                )
+                raise ValueError(f"Metadata {idx} has empty address field")
+
+            data.append(row)
+
+        logger.info("Prepared %d address metadata rows for insertion", len(data))
+
+        client.insert(
+            f"{clickhouse_config.database}.address_metadata",
+            data,
+            column_names=[
+                "address",
+                "address_type",
+                "transaction_count",
+                "first_transaction_date",
+                "checked_at",
+            ],
+        )
+
+        logger.info(
+            "Successfully inserted %d address metadata records to ClickHouse", len(data)
+        )
+        return len(data)
+
+    except Exception as e:
+        logger.error("Error writing address metadata to ClickHouse: %s", e)
+        if "data" in locals() and data:
+            logger.error(
+                "Failed batch had %d rows. First row types: %s",
+                len(data),
+                [type(x).__name__ for x in data[0]],
+            )
+            logger.error("First row values: %s", data[0])
+        raise
+
+
 def run_writer():
     """Main writer loop"""
     logger.info("=" * 60)
@@ -632,6 +751,9 @@ def run_writer():
     trades_pending = queue.get_pending_count(
         redis_config.TRADES_STREAM, redis_config.TRADES_GROUP
     )
+    address_metadata_length = queue.get_stream_length(
+        redis_config.ADDRESS_METADATA_STREAM
+    )
 
     logger.info("Markets stream: %d messages", markets_length)
     logger.info("Polymarket Events stream: %d messages", events_length)
@@ -641,6 +763,7 @@ def run_writer():
         trades_length,
         trades_pending,
     )
+    logger.info("Address Metadata stream: %d messages", address_metadata_length)
 
     if trades_pending > 100000:
         logger.warning(
@@ -663,13 +786,13 @@ def run_writer():
     markets_buffer = []
     events_buffer = []
     trades_buffer = []
+    address_metadata_buffer = []
+    markets_message_ids = []  # Track message IDs for ACKs
+    events_message_ids = []  # Track message IDs for ACKs
     trades_message_ids = []  # Track ALL message IDs in buffer, not just current batch
+    address_metadata_message_ids = []  # Track message IDs for ACKs
     last_flush_time = time.time()
     last_trim_time = time.time()
-
-    # Track last message IDs for simple reads to avoid skipping existing messages
-    markets_last_id = "0"  # Start from beginning
-    events_last_id = "0"  # Start from beginning
 
     try:
         while True:
@@ -682,44 +805,132 @@ def run_writer():
                 len(markets_buffer) > 1000
                 or len(events_buffer) > 1000
                 or len(trades_buffer) > 1000
+                or len(address_metadata_buffer) > 1000
             )
             block_time = 100 if buffer_has_data else 1000  # 100ms vs 1s
 
-            # Read from markets stream (track position to not skip existing messages)
-            markets_messages = queue.read_from_stream_simple(
+            # First, try to claim idle pending messages for markets (dead consumer recovery)
+            claimed_markets = queue.claim_idle_messages(
                 redis_config.MARKETS_STREAM,
-                last_id=markets_last_id,
+                redis_config.MARKETS_GROUP,
+                consumer_name,
+                min_idle_time=60000,  # Claim messages idle for >60 seconds
                 count=processing_config.clickhouse_writer_batch_size,
-                block=block_time,
             )
 
-            if markets_messages:
-                markets_buffer.extend([data for _, data in markets_messages])
-                # Update last read ID
-                markets_last_id = markets_messages[-1][0]
+            if claimed_markets:
+                for msg_id, market_data in claimed_markets:
+                    markets_buffer.append(market_data)
+                    markets_message_ids.append(msg_id)
                 logger.info(
-                    "Added %d markets to buffer (total: %d)",
-                    len(markets_messages),
+                    "Claimed %d idle markets (total buffer: %d)",
+                    len(claimed_markets),
                     len(markets_buffer),
                 )
 
-            # Read from polymarket events stream (track position to not skip existing messages)
-            events_messages = queue.read_from_stream_simple(
+            # Then read new messages from markets stream using consumer groups
+            markets_messages = []
+            if len(claimed_markets) < processing_config.clickhouse_writer_batch_size:
+                markets_messages = queue.read_from_stream(
+                    redis_config.MARKETS_STREAM,
+                    redis_config.MARKETS_GROUP,
+                    consumer_name,
+                    count=processing_config.clickhouse_writer_batch_size,
+                    block=block_time,
+                )
+
+                if markets_messages:
+                    for msg_id, market_data in markets_messages:
+                        markets_buffer.append(market_data)
+                        markets_message_ids.append(msg_id)
+                    logger.info(
+                        "Added %d new markets to buffer (total: %d)",
+                        len(markets_messages),
+                        len(markets_buffer),
+                    )
+
+            # First, try to claim idle pending messages for events (dead consumer recovery)
+            claimed_events = queue.claim_idle_messages(
                 redis_config.POLYMARKET_EVENTS_STREAM,
-                last_id=events_last_id,
+                redis_config.POLYMARKET_EVENTS_GROUP,
+                consumer_name,
+                min_idle_time=60000,  # Claim messages idle for >60 seconds
                 count=processing_config.clickhouse_writer_batch_size,
-                block=block_time,
             )
 
-            if events_messages:
-                events_buffer.extend([data for _, data in events_messages])
-                # Update last read ID
-                events_last_id = events_messages[-1][0]
+            if claimed_events:
+                for msg_id, event_data in claimed_events:
+                    events_buffer.append(event_data)
+                    events_message_ids.append(msg_id)
                 logger.info(
-                    "Added %d events to buffer (total: %d)",
-                    len(events_messages),
+                    "Claimed %d idle events (total buffer: %d)",
+                    len(claimed_events),
                     len(events_buffer),
                 )
+
+            # Then read new messages from polymarket events stream using consumer groups
+            events_messages = []
+            if len(claimed_events) < processing_config.clickhouse_writer_batch_size:
+                events_messages = queue.read_from_stream(
+                    redis_config.POLYMARKET_EVENTS_STREAM,
+                    redis_config.POLYMARKET_EVENTS_GROUP,
+                    consumer_name,
+                    count=processing_config.clickhouse_writer_batch_size,
+                    block=block_time,
+                )
+
+                if events_messages:
+                    for msg_id, event_data in events_messages:
+                        events_buffer.append(event_data)
+                        events_message_ids.append(msg_id)
+                    logger.info(
+                        "Added %d new events to buffer (total: %d)",
+                        len(events_messages),
+                        len(events_buffer),
+                    )
+
+            # First, try to claim idle pending messages for address metadata (dead consumer recovery)
+            claimed_address_metadata = queue.claim_idle_messages(
+                redis_config.ADDRESS_METADATA_STREAM,
+                redis_config.ADDRESS_METADATA_GROUP,
+                consumer_name,
+                min_idle_time=60000,  # Claim messages idle for >60 seconds
+                count=processing_config.clickhouse_writer_batch_size,
+            )
+
+            if claimed_address_metadata:
+                for msg_id, metadata in claimed_address_metadata:
+                    address_metadata_buffer.append(metadata)
+                    address_metadata_message_ids.append(msg_id)
+                logger.info(
+                    "Claimed %d idle address metadata (total buffer: %d)",
+                    len(claimed_address_metadata),
+                    len(address_metadata_buffer),
+                )
+
+            # Then read new messages from address metadata stream using consumer groups
+            address_metadata_messages = []
+            if (
+                len(claimed_address_metadata)
+                < processing_config.clickhouse_writer_batch_size
+            ):
+                address_metadata_messages = queue.read_from_stream(
+                    redis_config.ADDRESS_METADATA_STREAM,
+                    redis_config.ADDRESS_METADATA_GROUP,
+                    consumer_name,
+                    count=processing_config.clickhouse_writer_batch_size,
+                    block=block_time,
+                )
+
+                if address_metadata_messages:
+                    for msg_id, metadata in address_metadata_messages:
+                        address_metadata_buffer.append(metadata)
+                        address_metadata_message_ids.append(msg_id)
+                    logger.info(
+                        "Added %d new address metadata to buffer (total: %d)",
+                        len(address_metadata_messages),
+                        len(address_metadata_buffer),
+                    )
 
             # First, try to claim idle pending messages from dead consumers
             # This ensures we process messages that were delivered but never acknowledged
@@ -769,17 +980,25 @@ def run_writer():
                 len(markets_buffer) >= processing_config.clickhouse_writer_batch_size
                 or len(events_buffer) >= processing_config.clickhouse_writer_batch_size
                 or len(trades_buffer) >= processing_config.clickhouse_writer_batch_size
+                or len(address_metadata_buffer)
+                >= processing_config.clickhouse_writer_batch_size
                 or time_since_flush >= processing_config.clickhouse_writer_max_wait
             )
 
-            if should_flush and (markets_buffer or events_buffer or trades_buffer):
+            if should_flush and (
+                markets_buffer
+                or events_buffer
+                or trades_buffer
+                or address_metadata_buffer
+            ):
                 logger.info("=" * 60)
                 logger.info("Flushing to ClickHouse...")
                 logger.info(
-                    "Buffer sizes - Markets: %d, Events: %d, Trades: %d",
+                    "Buffer sizes - Markets: %d, Events: %d, Trades: %d, Address Metadata: %d",
                     len(markets_buffer),
                     len(events_buffer),
                     len(trades_buffer),
+                    len(address_metadata_buffer),
                 )
 
                 # Write markets
@@ -789,6 +1008,15 @@ def run_writer():
                         count = write_markets_batch(client, markets_buffer)
                         logger.info("✓ Wrote %d markets to ClickHouse", count)
                         markets_buffer.clear()
+
+                        # Acknowledge markets messages
+                        if markets_message_ids:
+                            queue.ack_messages(
+                                redis_config.MARKETS_STREAM,
+                                redis_config.MARKETS_GROUP,
+                                markets_message_ids,
+                            )
+                            markets_message_ids.clear()
                     except Exception as e:
                         logger.error("Failed to write markets batch: %s", e)
                         raise
@@ -800,6 +1028,15 @@ def run_writer():
                         count = write_events_batch(client, events_buffer)
                         logger.info("✓ Wrote %d events to ClickHouse", count)
                         events_buffer.clear()
+
+                        # Acknowledge events messages
+                        if events_message_ids:
+                            queue.ack_messages(
+                                redis_config.POLYMARKET_EVENTS_STREAM,
+                                redis_config.POLYMARKET_EVENTS_GROUP,
+                                events_message_ids,
+                            )
+                            events_message_ids.clear()
                     except Exception as e:
                         logger.error("Failed to write events batch: %s", e)
                         raise
@@ -824,6 +1061,30 @@ def run_writer():
                         logger.error("Failed to write trades batch: %s", e)
                         raise
 
+                # Write address metadata
+                if address_metadata_buffer:
+                    logger.info("Writing address metadata batch...")
+                    try:
+                        count = write_address_metadata_batch(
+                            client, address_metadata_buffer
+                        )
+                        logger.info(
+                            "✓ Wrote %d address metadata records to ClickHouse", count
+                        )
+                        address_metadata_buffer.clear()
+
+                        # Acknowledge address metadata messages
+                        if address_metadata_message_ids:
+                            queue.ack_messages(
+                                redis_config.ADDRESS_METADATA_STREAM,
+                                redis_config.ADDRESS_METADATA_GROUP,
+                                address_metadata_message_ids,
+                            )
+                            address_metadata_message_ids.clear()
+                    except Exception as e:
+                        logger.error("Failed to write address metadata batch: %s", e)
+                        raise
+
                 logger.info("✓ Flush complete")
                 logger.info("=" * 60)
                 last_flush_time = time.time()
@@ -834,24 +1095,27 @@ def run_writer():
             if time_since_trim >= 60:  # 1 minute (more frequent to prevent buildup)
                 logger.info("Checking streams for safe trimming...")
 
-                # For TRADES stream, check pending count before trimming
+                # Trim to a smaller size (20k) to prevent unbounded growth
+                MAX_LENGTH = 20000
+
+                # For all streams with consumer groups, check pending count before trimming
+                # This ensures we never trim unacknowledged messages
+
+                # TRADES stream
                 trades_pending_count = queue.get_pending_count(
                     redis_config.TRADES_STREAM, redis_config.TRADES_GROUP
                 )
                 trades_total = queue.get_stream_length(redis_config.TRADES_STREAM)
 
-                # Trim to a smaller size (20k) to prevent unbounded growth
-                MAX_TRADES_LENGTH = 20000
-
                 # Only trim if we have acknowledged messages (total - pending > threshold)
-                if trades_total - trades_pending_count > MAX_TRADES_LENGTH:
+                if trades_total - trades_pending_count > MAX_LENGTH:
                     logger.info(
                         "TRADES: %d total, %d pending. Trimming acknowledged messages...",
                         trades_total,
                         trades_pending_count,
                     )
                     queue.trim_stream(
-                        redis_config.TRADES_STREAM, max_length=MAX_TRADES_LENGTH
+                        redis_config.TRADES_STREAM, max_length=MAX_LENGTH
                     )
                     after_trim = queue.get_stream_length(redis_config.TRADES_STREAM)
                     logger.info(
@@ -864,41 +1128,104 @@ def run_writer():
                         "TRADES: %d total, %d pending. Not trimming yet (threshold: %d)",
                         trades_total,
                         trades_pending_count,
-                        MAX_TRADES_LENGTH,
+                        MAX_LENGTH,
                     )
 
-                # For MARKETS and EVENTS, we track our position with last_id
-                # These can be trimmed safely since we've read them
-                MAX_MARKETS_LENGTH = 20000
-                markets_len = queue.get_stream_length(redis_config.MARKETS_STREAM)
-                if markets_len > MAX_MARKETS_LENGTH:
+                # MARKETS stream - now uses consumer groups, check pending
+                markets_pending_count = queue.get_pending_count(
+                    redis_config.MARKETS_STREAM, redis_config.MARKETS_GROUP
+                )
+                markets_total = queue.get_stream_length(redis_config.MARKETS_STREAM)
+
+                if markets_total - markets_pending_count > MAX_LENGTH:
                     logger.info(
-                        "Trimming MARKETS stream from %d messages...", markets_len
+                        "MARKETS: %d total, %d pending. Trimming acknowledged messages...",
+                        markets_total,
+                        markets_pending_count,
                     )
                     queue.trim_stream(
-                        redis_config.MARKETS_STREAM, max_length=MAX_MARKETS_LENGTH
+                        redis_config.MARKETS_STREAM, max_length=MAX_LENGTH
                     )
                     after_trim = queue.get_stream_length(redis_config.MARKETS_STREAM)
-                    logger.info("✓ Trimmed MARKETS to %d messages", after_trim)
+                    logger.info(
+                        "✓ Trimmed MARKETS from %d to %d messages",
+                        markets_total,
+                        after_trim,
+                    )
+                else:
+                    logger.debug(
+                        "MARKETS: %d total, %d pending. Not trimming yet (threshold: %d)",
+                        markets_total,
+                        markets_pending_count,
+                        MAX_LENGTH,
+                    )
 
-                MAX_EVENTS_LENGTH = 20000
-                events_len = queue.get_stream_length(
+                # POLYMARKET_EVENTS stream - now uses consumer groups, check pending
+                events_pending_count = queue.get_pending_count(
+                    redis_config.POLYMARKET_EVENTS_STREAM,
+                    redis_config.POLYMARKET_EVENTS_GROUP,
+                )
+                events_total = queue.get_stream_length(
                     redis_config.POLYMARKET_EVENTS_STREAM
                 )
-                if events_len > MAX_EVENTS_LENGTH:
+
+                if events_total - events_pending_count > MAX_LENGTH:
                     logger.info(
-                        "Trimming POLYMARKET_EVENTS stream from %d messages...",
-                        events_len,
+                        "POLYMARKET_EVENTS: %d total, %d pending. Trimming acknowledged messages...",
+                        events_total,
+                        events_pending_count,
                     )
                     queue.trim_stream(
-                        redis_config.POLYMARKET_EVENTS_STREAM,
-                        max_length=MAX_EVENTS_LENGTH,
+                        redis_config.POLYMARKET_EVENTS_STREAM, max_length=MAX_LENGTH
                     )
                     after_trim = queue.get_stream_length(
                         redis_config.POLYMARKET_EVENTS_STREAM
                     )
                     logger.info(
-                        "✓ Trimmed POLYMARKET_EVENTS to %d messages", after_trim
+                        "✓ Trimmed POLYMARKET_EVENTS from %d to %d messages",
+                        events_total,
+                        after_trim,
+                    )
+                else:
+                    logger.debug(
+                        "POLYMARKET_EVENTS: %d total, %d pending. Not trimming yet (threshold: %d)",
+                        events_total,
+                        events_pending_count,
+                        MAX_LENGTH,
+                    )
+
+                # ADDRESS_METADATA stream - now uses consumer groups, check pending
+                address_metadata_pending_count = queue.get_pending_count(
+                    redis_config.ADDRESS_METADATA_STREAM,
+                    redis_config.ADDRESS_METADATA_GROUP,
+                )
+                address_metadata_total = queue.get_stream_length(
+                    redis_config.ADDRESS_METADATA_STREAM
+                )
+
+                if address_metadata_total - address_metadata_pending_count > MAX_LENGTH:
+                    logger.info(
+                        "ADDRESS_METADATA: %d total, %d pending. Trimming acknowledged messages...",
+                        address_metadata_total,
+                        address_metadata_pending_count,
+                    )
+                    queue.trim_stream(
+                        redis_config.ADDRESS_METADATA_STREAM, max_length=MAX_LENGTH
+                    )
+                    after_trim = queue.get_stream_length(
+                        redis_config.ADDRESS_METADATA_STREAM
+                    )
+                    logger.info(
+                        "✓ Trimmed ADDRESS_METADATA from %d to %d messages",
+                        address_metadata_total,
+                        after_trim,
+                    )
+                else:
+                    logger.debug(
+                        "ADDRESS_METADATA: %d total, %d pending. Not trimming yet (threshold: %d)",
+                        address_metadata_total,
+                        address_metadata_pending_count,
+                        MAX_LENGTH,
                     )
 
                 logger.info("✓ Safe trimming complete")
@@ -907,27 +1234,61 @@ def run_writer():
             # Small sleep if no data
             if (
                 not markets_messages
+                and not claimed_markets
                 and not events_messages
+                and not claimed_events
                 and not trades_messages
                 and not claimed_messages
+                and not address_metadata_messages
+                and not claimed_address_metadata
             ):
                 time.sleep(1)
 
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, flushing remaining data...")
 
-        # Flush remaining data
+        # Flush remaining data and acknowledge
         if markets_buffer:
             write_markets_batch(client, markets_buffer)
             logger.info("✓ Flushed %d remaining markets", len(markets_buffer))
+            if markets_message_ids:
+                queue.ack_messages(
+                    redis_config.MARKETS_STREAM,
+                    redis_config.MARKETS_GROUP,
+                    markets_message_ids,
+                )
 
         if events_buffer:
             write_events_batch(client, events_buffer)
             logger.info("✓ Flushed %d remaining events", len(events_buffer))
+            if events_message_ids:
+                queue.ack_messages(
+                    redis_config.POLYMARKET_EVENTS_STREAM,
+                    redis_config.POLYMARKET_EVENTS_GROUP,
+                    events_message_ids,
+                )
 
         if trades_buffer:
             write_trades_batch(client, trades_buffer)
             logger.info("✓ Flushed %d remaining trades", len(trades_buffer))
+            if trades_message_ids:
+                queue.ack_messages(
+                    redis_config.TRADES_STREAM,
+                    redis_config.TRADES_GROUP,
+                    trades_message_ids,
+                )
+
+        if address_metadata_buffer:
+            write_address_metadata_batch(client, address_metadata_buffer)
+            logger.info(
+                "✓ Flushed %d remaining address metadata", len(address_metadata_buffer)
+            )
+            if address_metadata_message_ids:
+                queue.ack_messages(
+                    redis_config.ADDRESS_METADATA_STREAM,
+                    redis_config.ADDRESS_METADATA_GROUP,
+                    address_metadata_message_ids,
+                )
 
     except Exception as e:
         logger.error("Fatal error: %s", e, exc_info=True)

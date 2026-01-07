@@ -143,6 +143,34 @@ def create_trades_table():
     logger.info("✓ Table 'trades' ready")
 
 
+def create_address_metadata_table():
+    """Create address metadata table"""
+    import clickhouse_connect
+
+    client = clickhouse_connect.get_client(
+        host=clickhouse_config.host,
+        port=clickhouse_config.port,
+        username=clickhouse_config.user,
+        password=clickhouse_config.password,
+        database=clickhouse_config.database,
+    )
+
+    schema = f"""
+    CREATE TABLE IF NOT EXISTS {clickhouse_config.database}.address_metadata (
+        address String,
+        address_type LowCardinality(String),
+        transaction_count UInt64,
+        first_transaction_date Nullable(DateTime),
+        checked_at DateTime,
+        modifiedDateTime DateTime DEFAULT now()
+    ) ENGINE = ReplacingMergeTree(modifiedDateTime)
+    ORDER BY address
+    """
+
+    client.command(schema)
+    logger.info("✓ Table 'address_metadata' ready")
+
+
 def main():
     """Run schema setup"""
     logger.info("=" * 60)
@@ -154,6 +182,7 @@ def main():
         create_markets_table()
         create_polymarket_events_table()
         create_trades_table()
+        create_address_metadata_table()
 
         logger.info("=" * 60)
         logger.info("✅ Schema setup complete!")

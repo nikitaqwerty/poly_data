@@ -103,6 +103,32 @@ services:
       - ./logs:/app/logs
     restart: unless-stopped
 
+  address-checker-ingester:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: address-checker-ingester
+    command: python3 ingesters/address_checker_ingester.py
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DATABASE=polymarket
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=clickhouse123
+      - POLYGON_RPC_URL=${POLYGON_RPC_URL:-https://polygon-rpc.com}
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
   trade-processor:
     build:
       context: .
